@@ -59,34 +59,60 @@
 
 ### 3.1 阶段钩子（同步、可改主流程）
 
-`entity/plugin.go` 定义 6 个可选接口，覆盖 Execute 循环每个环节。插件只需实现关心的环节，其余通过类型断言按需启用：
+`entity/plugin.go` 定义 **16 个可选接口**，覆盖 Execute 循环的**每个时间点**。插件只需实现关心的环节，其余通过类型断言按需启用：
 
 ```
-┌─ OnTurnStart   一次会话开始、构造对话之前（可改 prompt）
+┌─ OnRunStart             Execute 刚进入（LLM 配置校验之前）
+├─ OnRunValidated         入参/LLM 存在性校验通过
+├─ OnTurnStart            会话开始，构造对话之前（可改 prompt）
+├─ OnConversationBuilt    初始对话构造完成（可改 conv：压缩/注入历史）
 │  ┌─ FOR 每轮迭代:
-│  │  ├─ OnLLMBefore  每次 LLM.Chat 之前（可改请求：加指令/调温度/过滤工具）
+│  │  ├─ OnIterationStart   迭代开始（i 递增后、ctx 检查前）
+│  │  ├─ OnLLMBefore        每次 LLM.Chat 之前（可改请求）
 │  │  ├─ LLM.Chat
-│  │  ├─ OnLLMAfter   每次 LLM.Chat 之后（可改响应：脱敏/预算/合成工具调用）
+│  │  ├─ OnLLMAfter         每次 LLM.Chat 之后（可改响应）
+│  │  ├─ OnFinalAnswer      LLM 不再要工具（可改最终答案，仅该分支）
 │  │  └─ FOR 每个工具调用:
-│  │     ├─ OnToolBefore  调用之前（可改请求；返回 err 则拒绝该工具，错误回传 LLM）
+│  │     ├─ OnToolLookup       查找前（可改 tool name：路由/别名）
+│  │     ├─ OnToolNotFound     未找到（可改 ToolReply 内容）
+│  │     ├─ OnToolBefore       Call 之前（可改请求；err=拒绝并回传 LLM）
 │  │     ├─ Tool.Call
-│  │     └─ OnToolAfter   调用之后（可改结果：限流退避/白名单/缓存/摘要）
-│  └─ END FOR
-└─ OnTurnEnd     Execute 返回前（成功/失败/取消均触发）
+│  │     ├─ OnToolAfter        Call 之后（可改结果）
+│  │     └─ OnToolReplyAppended 结果追加进对话后
+│  ├─ OnIterationEnd     一轮结束（所有工具处理完、切回 Thinking）
+│  └─ OnMaxIterations    达到 MaxIterations（可改兜底 FinalAnswer）
+└─ OnTurnEnd             Execute 返回前（所有终止路径）
 ```
+
+**致命 vs 非致命策略**：
+
+| 钩子 | 错误策略 | 说明 |
+|---|---|---|
+| `OnRunStart` / `OnRunValidated` / `OnTurnStart` / `OnConversationBuilt` / `OnIterationStart` | **致命**：返回 err 直接终止 Execute | 会话/迭代尚未真正开始，终止是安全的 |
+| `OnLLMBefore` / `OnLLMAfter` | **非致命**：记录 + 用原数据继续 | 避免一个观测插件搞挂 LLM 调用 |
+| `OnFinalAnswer` / `OnMaxIterations` | **非致命**：记录 + 用原数据继续 | 答案已就绪，不应被插件阻断 |
+| `OnToolLookup` / `OnToolBefore` | **拒绝工具**：err 转成 ToolReply 回传 LLM | 工具级白名单/限流 |
+| `OnToolNotFound` / `OnToolAfter` / `OnToolReplyAppended` / `OnIterationEnd` / `OnTurnEnd` | **非致命**：记录 + 继续 | 已过关键路径，不阻断 |
 
 触发实现见 [usecase/run.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/usecase/run.go) 的 `Execute` / `dispatchTool` / `runTurnEnd`。
 
 ### 3.2 事件总线（发布/订阅、只读观察）
 
-`entity/event.go` 定义 `EventBus`（`Subscribe` + `Publish`）。Usecase 在每个环节**既触发钩子、又发布事件**：
+`entity/event.go` 定义 `EventBus`（`Subscribe` + `Publish`）。Usecase 在每个时间点**既触发钩子、又发布事件**：
 
 | EventType | 触发时机 |
 |---|---|
+| `run.start` / `run.validated` | Execute 刚进入 / 校验通过 |
 | `turn.start` / `turn.end` | 会话开始 / 返回前（所有终止路径） |
+| `conversation.built` | 初始对话（system+user）构造完成 |
+| `iteration.start` / `iteration.end` / `iteration.max` | 每轮开始 / 结束 / 达到 MaxIterations |
+| `ctx.cancelled` | ctx.Done() 命中 |
 | `llm.before` / `llm.after` | 每次 LLM.Chat 前后 |
+| `final.answer` | LLM 不再要工具，准备返回最终答案 |
+| `tool.lookup` / `tool.notfound` | 查找工具前 / 查找失败 |
 | `tool.before` / `tool.after` | 每次 Tool.Call 前后 |
-| `error` | **任意环节出现错误时**——这是"每个工具和插件的报错都能被捕捉"的关键出口 |
+| `tool.reply.appended` | 工具结果追加进对话后 |
+| `error` | **任意环节出现错误时**——"每个工具和插件的报错都能被捕捉"的关键出口 |
 
 **两者区别**：钩子能"改"主流程数据；事件总线只能"看"，不能阻断或修改。需要改行为用钩子；需要做遥测/日志/审计用事件总线。事件总线单个订阅者 panic 会被 recover，不影响后续订阅者或主流程。
 
@@ -105,16 +131,20 @@
 |---|---|---|
 | `Tool.Call` 返回 `IsError=true` | `Result.Content` 作为 `ToolReply` 追加进对话 | ✅ |
 | `Tool.Call` panic | `callToolSafe` recover → 转错误 `Result` → 同上 | ✅ |
+| `OnToolLookup` 钩子返回 err | 拒绝工具，错误作为 `ToolReply` 回传 LLM | ✅ |
 | `OnToolBefore` 钩子返回 err | 拒绝该工具，错误信息作为 `ToolReply` | ✅ |
-| 工具未找到 | `ErrToolNotFound` 信息作为 `ToolReply` | ✅ |
-| `OnTurnStart` 返回 err | 视为致命，终止整个运行 | —（终止） |
-| `OnLLMBefore/After`、`OnToolAfter`、`OnTurnEnd` 返回 err | 记录 + 发布 `EventError`，用原数据继续 | 旁路捕捉 |
+| 工具未找到 | `ErrToolNotFound` 信息作为 `ToolReply`（钩子可改内容） | ✅ |
+| `OnRunStart`/`RunValidated`/`TurnStart`/`ConversationBuilt`/`IterationStart` 返回 err | 视为致命，终止整个运行 | —（终止） |
+| `OnLLMBefore/After`、`OnFinalAnswer`、`OnMaxIterations`、`OnToolNotFound`、`OnToolAfter`、`OnToolReplyAppended`、`OnIterationEnd`、`OnTurnEnd` 返回 err | 记录 + 发布 `EventError`，用原数据继续 | 旁路捕捉 |
 | `LLM.Chat` 本身 err | 终止运行 + 发布 `EventError` + 触发 `OnTurnEnd` | —（终止） |
 | 钩子自身 panic | `runHook` recover → 转 err → 按上述策略处理 | 视环节而定 |
 
 对应测试见 [usecase/run_test.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/usecase/run_test.go)：
 `TestExecute_ToolError_ReturnedToLLM`、`TestExecute_ToolPanic_RecoveredAndReturnedToLLM`、
-`TestExecute_ToolNotFound_ReturnedToLLM`、`TestExecute_OnToolBeforeRejects_ReturnedToLLM`。
+`TestExecute_ToolNotFound_ReturnedToLLM`、`TestExecute_OnToolBeforeRejects_ReturnedToLLM`、
+`TestExecute_ToolLookupError_RejectsTool`、`TestExecute_ToolNotFoundRewritesReply`、
+`TestExecute_RunStartError_Aborts`、`TestExecute_RunValidatedError_Aborts`、
+`TestExecute_ConversationBuiltError_Aborts`、`TestExecute_IterationStartError_Aborts`。
 
 ---
 
@@ -125,29 +155,47 @@
                                  │
     ┌────────────────────────────┘
     ▼
- ① OnTurnStart 钩子（可改 prompt） + 发布 turn.start 事件
+ ① OnRunStart 钩子（可改 prompt） + 发布 run.start
+    │  agent nil 检查 + LLM 配置检查
+    ▼
+ ② OnRunValidated 钩子 + 发布 run.validated
+    │  OnTurnStart 钩子（可改 prompt） + 发布 turn.start
     │  构造 Conversation: [System?] → [User: prompt]
     ▼
- ② FOR i=1..MaxIterations:
+ ③ OnConversationBuilt 钩子（可改 conv） + 发布 conversation.built
+    │
+    ▼ FOR i=1..MaxIterations:
+    │   ├─ OnIterationStart 钩子 + 发布 iteration.start
+    │   ├─ ctx.Done() 检查 → 命中则发布 ctx.cancelled + 终止
     │   ├─ OnLLMBefore 钩子（可改请求） + 发布 llm.before
     │   ├─ LLM.Chat(ctx, {Model, Messages, Tools})
     │   ├─ OnLLMAfter 钩子（可改响应） + 发布 llm.after
     │   │
     │   ├─ IF ToolCalls 为空:
-    │   │     保存 assistant 回答, RETURN FinalAnswer ✓（触发 OnTurnEnd）
+    │   │     OnFinalAnswer 钩子（可改答案） + 发布 final.answer
+    │   │     RETURN FinalAnswer ✓（触发 OnTurnEnd）
     │   │
     │   └─ ELSE (有工具调用):
     │         ┌ FOR EACH tc IN ToolCalls:
-    │         │    FindTool → 未找到 → ToolReply("未找到") 回传 LLM
-    │         │    OnToolBefore 钩子 → 返回 err → ToolReply("被拒绝") 回传 LLM
+    │         │    OnToolLookup 钩子（可改 name） + 发布 tool.lookup
+    │         │      └ err → ToolReply("拒绝") 回传 LLM + 发布 tool.reply.appended
+    │         │    FindTool → 未找到:
+    │         │      OnToolNotFound 钩子（可改 reply） + 发布 tool.notfound
+    │         │      → ToolReply(回复) 回传 LLM + 发布 tool.reply.appended
+    │         │    OnToolBefore 钩子（可改请求）
+    │         │      └ err → ToolReply("被拒绝") 回传 LLM + 发布 tool.reply.appended
     │         │    tool.Call（callToolSafe 带 panic 恢复）
     │         │      └ IsError → ToolReply(错误内容) 回传 LLM
     │         │    OnToolAfter 钩子（可改结果） + 发布 tool.after
-    │         │    Conversation.Append(ToolReply)
+    │         │    Conversation.Append(ToolReply) + 发布 tool.reply.appended
+    │         │    OnToolReplyAppended 钩子
     │         └ END FOR
-    │         回到步骤 ② 再问 LLM 一次 ▲
+    │         OnIterationEnd 钩子 + 发布 iteration.end
+    │         回到 FOR 再问 LLM 一次 ▲
     │
-    └ 达到 MaxIterations → 用最后一条 Message 兜底返回（触发 OnTurnEnd）
+    └ 达到 MaxIterations:
+       OnMaxIterations 钩子（可改兜底） + 发布 iteration.max
+       RETURN FallbackAnswer（触发 OnTurnEnd）
 ```
 
 ---

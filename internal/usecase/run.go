@@ -4,11 +4,12 @@
 // "用户 prompt → LLM → 可选工具调用 → 最终答案"循环。
 //
 // 本文件同时是插件/事件机制与错误回传策略的"编排中心"：
-//   - 在循环的每个环节按需类型断言并触发 6 个阶段钩子（可改主流程数据）；
-//   - 在每个环节向 EventBus 发布事件（只读观察旁路）；
-//   - 工具路径上的所有错误（Call 报错、panic、OnToolBefore 拒绝、
+//   - 在循环的 16 个时间点按需类型断言并触发全部钩子（可改主流程数据）；
+//   - 在每个时间点向 EventBus 发布对应事件（只读观察旁路）；
+//   - 工具路径上的所有错误（Call 报错、panic、OnToolLookup/ToolBefore 拒绝、
 //     工具未找到）都转成 ToolReply 追加进对话，回传给 LLM；
-//   - 其余环节的钩子错误经 EventBus 广播 + 日志记录，不阻断主流程。
+//   - 致命钩子（RunStart/RunValidated/TurnStart/ConversationBuilt/IterationStart）
+//     返回 err 会直接终止 Execute；其余钩子错误经 EventBus 广播 + 日志，不阻断。
 package usecase
 
 import (
@@ -60,27 +61,77 @@ func NewRunUsecase(log Logger) *RunUsecase {
 	return &RunUsecase{Logger: log}
 }
 
-// Execute 驱动完整 Agent 循环：构造对话 → 调 LLM → 分发工具调用 →
-// 重复直到 LLM 不再要工具或达到 MaxIterations。
-//
-// 每个环节都会触发对应阶段钩子 + 发布事件，详见 entity/plugin.go
-// 顶部文档与 entity/event.go。
+// Execute 驱动完整 Agent 循环，在 16 个时间点全部触发钩子 + 发布事件。
+// 详见 entity/plugin.go 顶部文档的触发时机总览图。
 func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput) (out RunOutput, err error) {
 	started := time.Now()
 	defer func() { out.Elapsed = time.Since(started) }()
 
+	// agent nil 检查必须最先做，否则 a.Plugins() 会 panic。
 	if a == nil {
 		return out, errors.New("usecase: agent 为 nil")
 	}
+
+	plugins := a.Plugins()
+	bus := a.EventBus()
+
+	// ================================================================
+	// ① RunStart — Execute 刚进入，LLM 配置校验之前
+	//    钩子可改 UserPrompt；err=致命终止
+	// ================================================================
+	runStartInfo := entity.RunStartInfo{UserPrompt: in.UserPrompt}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventRunStart, Payload: runStartInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithRunStart)
+		if !ok {
+			continue
+		}
+		modified, herr := runHook(uc, ctx, p.ID(), "run.start", func() (entity.RunStartInfo, error) {
+			return h.OnRunStart(ctx, a, runStartInfo)
+		}, bus)
+		if herr != nil {
+			// RunStart 错误视为致命：尚未开始任何工作，直接终止。
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Err: herr})
+			return out, fmt.Errorf("usecase: run.start 钩子 %s: %w", p.ID(), herr)
+		}
+		runStartInfo = modified
+	}
+	if runStartInfo.UserPrompt != "" {
+		in.UserPrompt = runStartInfo.UserPrompt
+	}
+
+	// ================================================================
+	// LLM 后端存在性校验
+	// ================================================================
 	if a.LLM() == nil {
 		return out, entity.ErrLLMNotConfigured
 	}
 
-	cfg := a.Config()
-	plugins := a.Plugins()
-	bus := a.EventBus()
+	// ================================================================
+	// ② RunValidated — 入参/后端存在性校验全部通过
+	//    err=致命终止
+	// ================================================================
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventRunValidated, Payload: nil})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithRunValidated)
+		if !ok {
+			continue
+		}
+		_, herr := runHook(uc, ctx, p.ID(), "run.validated", func() (struct{}, error) {
+			return struct{}{}, h.OnRunValidated(ctx, a)
+		}, bus)
+		if herr != nil {
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Err: herr})
+			return out, fmt.Errorf("usecase: run.validated 钩子 %s: %w", p.ID(), herr)
+		}
+	}
 
-	// === TurnStart 阶段 ===
+	cfg := a.Config()
+
+	// ================================================================
+	// ③ TurnStart — 会话开始，构造对话之前
+	//    钩子可改 prompt；err=致命终止
+	// ================================================================
 	a.SetState(entity.AgentThinking)
 	turnStartInfo := entity.TurnStartInfo{UserPrompt: in.UserPrompt, Iteration: 0}
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventTurnStart, Payload: turnStartInfo})
@@ -93,9 +144,8 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			return h.OnTurnStart(ctx, a, turnStartInfo)
 		}, bus)
 		if herr != nil {
-			// TurnStart 错误视为致命：会话尚未真正开始，直接终止。
 			a.SetState(entity.AgentError)
-			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: 0, Err: herr})
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Err: herr})
 			return out, fmt.Errorf("usecase: turn.start 钩子 %s: %w", p.ID(), herr)
 		}
 		turnStartInfo = modified
@@ -113,6 +163,29 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	}
 	conv = conv.Append(entity.User(prompt))
 
+	// ================================================================
+	// ④ ConversationBuilt — 初始对话（system+user）构造完成
+	//    钩子可改 conv（注入历史/压缩/截断）；err=致命终止
+	// ================================================================
+	convInfo := entity.ConversationBuiltInfo{Conversation: conv, Config: cfg}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventConversationBuilt, Payload: convInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithConversationBuilt)
+		if !ok {
+			continue
+		}
+		modified, herr := runHook(uc, ctx, p.ID(), "conversation.built", func() (entity.ConversationBuiltInfo, error) {
+			return h.OnConversationBuilt(ctx, a, convInfo)
+		}, bus)
+		if herr != nil {
+			a.SetState(entity.AgentError)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Err: herr})
+			return out, fmt.Errorf("usecase: conversation.built 钩子 %s: %w", p.ID(), herr)
+		}
+		convInfo = modified
+	}
+	conv = convInfo.Conversation
+
 	uc.Logger.Info(ctx, "开始 agent 运行", "agent", cfg.Name,
 		"iterations", cfg.MaxIterations, "tools", len(a.Tools()), "plugins", len(plugins))
 
@@ -124,16 +197,47 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 
 	for i := 0; i < cfg.MaxIterations; i++ {
 		out.Iterations = i + 1
+		iterInfo := entity.IterationInfo{Index: i + 1, Remaining: cfg.MaxIterations - i}
+
+		// ============================================================
+		// ⑤ IterationStart — 每轮迭代开始（i 递增后、ctx 检查前）
+		//    err=致命终止
+		// ============================================================
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventIterationStart, Payload: iterInfo})
+		for _, p := range plugins {
+			h, ok := p.(entity.WithIterationStart)
+			if !ok {
+				continue
+			}
+			_, herr := runHook(uc, ctx, p.ID(), "iteration.start", func() (struct{}, error) {
+				return struct{}{}, h.OnIterationStart(ctx, a, iterInfo)
+			}, bus)
+			if herr != nil {
+				a.SetState(entity.AgentError)
+				uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
+					Iterations: i + 1, Err: herr,
+				})
+				return out, fmt.Errorf("usecase: iteration.start 钩子 %s: %w", p.ID(), herr)
+			}
+		}
+
+		// ============================================================
+		// ⑥ CtxCancelled — ctx.Done() 命中
+		// ============================================================
 		select {
 		case <-ctx.Done():
 			a.SetState(entity.AgentError)
+			uc.publish(bus, ctx, entity.Event{Type: entity.EventCtxCancelled, Payload: iterInfo, Err: ctx.Err()})
 			uc.publishError(bus, ctx, "ctx", ctx.Err())
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: ctx.Err()})
 			return out, ctx.Err()
 		default:
 		}
 
-		// === LLMBefore 阶段 ===
+		// ============================================================
+		// ⑦ LLMBefore — ChatRequest 构建完，LLM.Chat 之前
+		//    钩子可改 req；err=非致命（用原请求继续）
+		// ============================================================
 		req := entity.ChatRequest{
 			Model:       model,
 			Messages:    conv,
@@ -149,7 +253,6 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 				return h.OnLLMBefore(ctx, a, req)
 			}, bus)
 			if herr != nil {
-				// 非致命：记录并继续用原请求，避免一个插件搞挂 LLM 调用。
 				uc.Logger.Warn(ctx, "llm.before 钩子错误，使用原请求",
 					"plugin", p.ID(), "err", herr)
 				continue
@@ -158,7 +261,9 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		}
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMBefore, Payload: req})
 
-		// === LLM 调用 ===
+		// ============================================================
+		// LLM.Chat 调用
+		// ============================================================
 		resp, lerr := a.LLM().Chat(ctx, req)
 		if lerr != nil {
 			a.SetState(entity.AgentError)
@@ -169,7 +274,10 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
 			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content))
 
-		// === LLMAfter 阶段 ===
+		// ============================================================
+		// ⑧ LLMAfter — LLM.Chat 成功返回后
+		//    钩子可改 resp；err=非致命（用原响应继续）
+		// ============================================================
 		for _, p := range plugins {
 			h, ok := p.(entity.WithLLMAfter)
 			if !ok {
@@ -188,7 +296,28 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMAfter, Payload: resp})
 
 		if len(resp.ToolCalls) == 0 {
-			out.FinalAnswer = resp.Content
+			// ========================================================
+			// ⑨ FinalAnswer — LLM 不再要工具，准备返回最终答案
+			//    钩子可改 answer；err=非致命
+			// ============================================================
+			faInfo := entity.FinalAnswerInfo{Answer: resp.Content, Iterations: i + 1}
+			uc.publish(bus, ctx, entity.Event{Type: entity.EventFinalAnswer, Payload: faInfo})
+			for _, p := range plugins {
+				h, ok := p.(entity.WithFinalAnswer)
+				if !ok {
+					continue
+				}
+				modified, herr := runHook(uc, ctx, p.ID(), "final.answer", func() (entity.FinalAnswerInfo, error) {
+					return h.OnFinalAnswer(ctx, a, faInfo)
+				}, bus)
+				if herr != nil {
+					uc.Logger.Warn(ctx, "final.answer 钩子错误，使用原答案",
+						"plugin", p.ID(), "err", herr)
+					continue
+				}
+				faInfo = modified
+			}
+			out.FinalAnswer = faInfo.Answer
 			a.SetState(entity.AgentDone)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
 				FinalAnswer: out.FinalAnswer, Iterations: i + 1, Err: nil,
@@ -199,17 +328,62 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		a.SetState(entity.AgentActing)
 		conv = conv.Append(entity.Assistant(resp.Content))
 
-		// === 工具阶段 ===
+		// ============================================================
+		// 工具阶段 — 遍历每个 ToolCall
+		// ============================================================
 		for _, tc := range resp.ToolCalls {
 			conv = uc.dispatchTool(ctx, a, plugins, bus, tools, tc, conv)
 		}
 
 		a.SetState(entity.AgentThinking)
+
+		// ============================================================
+		// ⑩ IterationEnd — 一轮迭代结束（所有工具处理完、切回 Thinking）
+		//    err=非致命
+		// ============================================================
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventIterationEnd, Payload: iterInfo})
+		for _, p := range plugins {
+			h, ok := p.(entity.WithIterationEnd)
+			if !ok {
+				continue
+			}
+			_, herr := runHook(uc, ctx, p.ID(), "iteration.end", func() (struct{}, error) {
+				return struct{}{}, h.OnIterationEnd(ctx, a, iterInfo)
+			}, bus)
+			if herr != nil {
+				uc.Logger.Warn(ctx, "iteration.end 钩子错误",
+					"plugin", p.ID(), "err", herr)
+			}
+		}
 	}
 
-	// 达到 MaxIterations 仍无最终答案，用最后一条消息兜底
+	// ================================================================
+	// ⑪ MaxIterations — 达到 MaxIterations 仍未拿到最终答案
+	//    钩子可改兜底 FallbackAnswer；err=非致命
+	// ================================================================
 	last := conv.Last()
-	out.FinalAnswer = last.Content
+	maxInfo := entity.MaxIterationsInfo{
+		Iterations:     cfg.MaxIterations,
+		LastMessage:    last.Content,
+		FallbackAnswer: last.Content,
+	}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventMaxIterations, Payload: maxInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithMaxIterations)
+		if !ok {
+			continue
+		}
+		modified, herr := runHook(uc, ctx, p.ID(), "iteration.max", func() (entity.MaxIterationsInfo, error) {
+			return h.OnMaxIterations(ctx, a, maxInfo)
+		}, bus)
+		if herr != nil {
+			uc.Logger.Warn(ctx, "iteration.max 钩子错误，使用原兜底",
+				"plugin", p.ID(), "err", herr)
+			continue
+		}
+		maxInfo = modified
+	}
+	out.FinalAnswer = maxInfo.FallbackAnswer
 	a.SetState(entity.AgentDone)
 	uc.Logger.Warn(ctx, "agent 循环达到 MaxIterations 仍未得到最终答案",
 		"max", cfg.MaxIterations)
@@ -219,8 +393,10 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	return out, nil
 }
 
-// dispatchTool 处理一次工具调用：查找工具 → ToolBefore 钩子 →
-// Call（含 panic 恢复）→ ToolAfter 钩子 → 追加 ToolReply。
+// dispatchTool 处理一次工具调用，覆盖 6 个工具级时间点：
+//
+//	⑫ ToolLookup → ⑬ ToolNotFound → ⑭ ToolBefore → Tool.Call → ⑮ ToolAfter → ⑯ ToolReplyAppended
+//
 // 所有错误路径都把错误信息作为 ToolReply 追加进对话回传 LLM。
 // 返回追加后的新对话。
 func (uc *RunUsecase) dispatchTool(
@@ -232,20 +408,77 @@ func (uc *RunUsecase) dispatchTool(
 	tc entity.ToolCall,
 	conv entity.Conversation,
 ) entity.Conversation {
-	t := findToolByName(tools, tc.Name)
+	// ================================================================
+	// ⑫ ToolLookup — 按名查找工具之前
+	//    钩子可改 ToolName（路由/别名）；err=拒绝工具（错误回传 LLM）
+	// ================================================================
+	lookupInfo := entity.ToolLookupInfo{ToolCallID: tc.ID, ToolName: tc.Name}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolLookup, Payload: lookupInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithToolLookup)
+		if !ok {
+			continue
+		}
+		modified, herr := runHook(uc, ctx, p.ID(), "tool.lookup", func() (entity.ToolLookupInfo, error) {
+			return h.OnToolLookup(ctx, a, lookupInfo)
+		}, bus)
+		if herr != nil {
+			msg := fmt.Sprintf("工具被插件 %s 在 lookup 阶段拒绝: %v", p.ID(), herr)
+			uc.Logger.Warn(ctx, "tool.lookup 钩子拒绝工具",
+				"tool", tc.Name, "plugin", p.ID(), "err", herr)
+			replyInfo := entity.ToolReplyInfo{ToolName: tc.Name, Content: msg, IsError: true}
+			conv = conv.Append(entity.ToolReply(tc.Name, msg))
+			uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
+			return conv
+		}
+		lookupInfo = modified
+	}
+	toolName := lookupInfo.ToolName
+
+	t := findToolByName(tools, toolName)
 	if t == nil {
-		msg := fmt.Sprintf("工具 %q 未找到，未执行任何动作", tc.Name)
-		uc.Logger.Warn(ctx, "工具查找失败", "tool", tc.Name)
+		// ============================================================
+		// ⑬ ToolNotFound — 工具查找失败
+		//    钩子可改 ToolReply 内容；err=非致命
+		// ============================================================
+		notFoundInfo := entity.ToolNotFoundInfo{
+			ToolCallID: tc.ID,
+			ToolName:   toolName,
+			Reply:      fmt.Sprintf("工具 %q 未找到，未执行任何动作", toolName),
+		}
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventToolNotFound, Payload: notFoundInfo})
 		uc.publishError(bus, ctx, "tool.lookup", entity.ErrToolNotFound)
-		return conv.Append(entity.ToolReply(tc.Name, msg))
+		for _, p := range plugins {
+			h, ok := p.(entity.WithToolNotFound)
+			if !ok {
+				continue
+			}
+			modified, herr := runHook(uc, ctx, p.ID(), "tool.notfound", func() (entity.ToolNotFoundInfo, error) {
+				return h.OnToolNotFound(ctx, a, notFoundInfo)
+			}, bus)
+			if herr != nil {
+				uc.Logger.Warn(ctx, "tool.notfound 钩子错误，使用原 Reply",
+					"plugin", p.ID(), "err", herr)
+				continue
+			}
+			notFoundInfo = modified
+		}
+		uc.Logger.Warn(ctx, "工具查找失败", "tool", toolName)
+		replyInfo := entity.ToolReplyInfo{ToolName: toolName, Content: notFoundInfo.Reply, IsError: true}
+		conv = conv.Append(entity.ToolReply(toolName, notFoundInfo.Reply))
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
+		return conv
 	}
 
 	toolReq := entity.Request{
-		Name:      tc.Name,
+		Name:      toolName,
 		Arguments: json.RawMessage(tc.Arguments),
 	}
 
-	// ToolBefore：钩子可改请求；返回 err 则拒绝该工具，错误回传 LLM。
+	// ================================================================
+	// ⑭ ToolBefore — Tool.Call 之前
+	//    钩子可改 req；err=拒绝工具（错误回传 LLM）
+	// ================================================================
 	blocked := false
 	for _, p := range plugins {
 		h, ok := p.(entity.WithToolBefore)
@@ -258,8 +491,10 @@ func (uc *RunUsecase) dispatchTool(
 		if herr != nil {
 			msg := fmt.Sprintf("工具被插件 %s 拒绝: %v", p.ID(), herr)
 			uc.Logger.Warn(ctx, "tool.before 钩子拒绝工具",
-				"tool", tc.Name, "plugin", p.ID(), "err", herr)
-			conv = conv.Append(entity.ToolReply(tc.Name, msg))
+				"tool", toolName, "plugin", p.ID(), "err", herr)
+			replyInfo := entity.ToolReplyInfo{ToolName: toolName, Content: msg, IsError: true}
+			conv = conv.Append(entity.ToolReply(toolName, msg))
+			uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
 			blocked = true
 			break
 		}
@@ -270,15 +505,20 @@ func (uc *RunUsecase) dispatchTool(
 	}
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolBefore, Payload: toolReq})
 
+	// ================================================================
 	// Tool.Call（带 panic 恢复）
+	// ================================================================
 	result := uc.callToolSafe(ctx, t, toolReq)
 	if result.IsError {
 		uc.Logger.Warn(ctx, "工具返回错误",
-			"tool", tc.Name, "content", truncate(result.Content, 200))
+			"tool", toolName, "content", truncate(result.Content, 200))
 		uc.publishError(bus, ctx, "tool.call", errors.New(result.Content))
 	}
 
-	// ToolAfter：钩子可改结果；错误仅记录，用原结果继续。
+	// ================================================================
+	// ⑮ ToolAfter — Tool.Call 之后（不论成功失败）
+	//    钩子可改 result；err=非致命（用原结果继续）
+	// ================================================================
 	for _, p := range plugins {
 		h, ok := p.(entity.WithToolAfter)
 		if !ok {
@@ -296,7 +536,32 @@ func (uc *RunUsecase) dispatchTool(
 	}
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolAfter, Payload: result})
 
-	return conv.Append(entity.ToolReply(tc.Name, result.Content))
+	// ================================================================
+	// ⑯ ToolReplyAppended — 工具结果追加进对话后
+	//    err=非致命（此点已过工具阶段）
+	// ================================================================
+	replyInfo := entity.ToolReplyInfo{
+		ToolName: toolName,
+		Content:  result.Content,
+		IsError:  result.IsError,
+	}
+	conv = conv.Append(entity.ToolReply(toolName, result.Content))
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithToolReplyAppended)
+		if !ok {
+			continue
+		}
+		_, herr := runHook(uc, ctx, p.ID(), "tool.reply.appended", func() (struct{}, error) {
+			return struct{}{}, h.OnToolReplyAppended(ctx, a, replyInfo)
+		}, bus)
+		if herr != nil {
+			uc.Logger.Warn(ctx, "tool.reply.appended 钩子错误",
+				"plugin", p.ID(), "err", herr)
+		}
+	}
+
+	return conv
 }
 
 // callToolSafe 调用 Tool.Call 并 recover 任意 panic，转成错误 Result。

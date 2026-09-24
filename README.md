@@ -4,9 +4,9 @@
 
 ## 核心能力
 
-- **插件扩展**：6 个阶段钩子（TurnStart/End、LLMBefore/After、ToolBefore/After）+ 工具注册，覆盖循环每个环节，可改主流程数据。
-- **事件机制**：`EventBus` 发布/订阅，在每个环节广播事件（含 `EventError`），只读观察旁路，不阻断主流程。
-- **错误回传**：工具/插件报错（含 panic）都转成 `ToolReply` 回传 LLM；其余错误经 `EventError` 旁路捕捉。
+- **插件扩展**：**16 个阶段钩子**覆盖 Execute 循环的**每个时间点**（RunStart/Validated、TurnStart/End、ConversationBuilt、IterationStart/End/Max、LLMBefore/After、FinalAnswer、ToolLookup/NotFound/Before/After/ReplyAppended），可改主流程数据。
+- **事件机制**：`EventBus` 发布/订阅，在每个时间点广播对应事件（含 `EventError`），只读观察旁路，不阻断主流程。
+- **错误回传**：工具/插件报错（含 panic、拒绝、未找到）都转成 `ToolReply` 回传 LLM；致命钩子错误终止运行，非致命错误经 `EventError` 旁路捕捉。
 - **零三方 Entity 层**：核心实体仅依赖 Go 标准库。
 
 ## 项目结构
@@ -63,12 +63,14 @@ go run . run -prompt "hello"
 
 ## 插件/事件机制速览
 
+- **16 个钩子**：`OnRunStart/Validated`、`OnTurnStart/End`、`OnConversationBuilt`、`OnIterationStart/End`、`OnMaxIterations`、`OnLLMBefore/After`、`OnFinalAnswer`、`OnToolLookup/NotFound/Before/After`、`OnToolReplyAppended` + `WithRegisterTools`（构建期）。
 - **写一个插件**：实现 `entity.Plugin`（`ID()`）+ 按需实现钩子接口，在 [di.go buildPlugins](internal/infrastructure/di.go) 追加。示例见 [plugin_hello.go](internal/infrastructure/plugin_hello.go)。
 - **插件自带工具**：实现 `WithRegisterTools`，工具会经 `mergeTools` 合并进 Agent（同名最后写入胜出）。
-- **订阅事件**：`bus.Subscribe(entity.EventError, handler)` 旁路观察所有环节错误。
-- **错误回传**：工具 `Call` 返回 `IsError=true`、panic、`OnToolBefore` 拒绝、工具未找到——都转成 `ToolReply` 回传 LLM。
+- **订阅事件**：`bus.Subscribe(entity.EventError, handler)` 旁路观察所有环节错误；也可订阅 `iteration.start`、`tool.reply.appended` 等 17 种事件。
+- **错误回传**：工具 `Call` 返回 `IsError=true`、panic、`OnToolLookup/ToolBefore` 拒绝、工具未找到——都转成 `ToolReply` 回传 LLM。
+- **致命 vs 非致命**：`RunStart/Validated/TurnStart/ConversationBuilt/IterationStart` 返回 err 直接终止；其余钩子错误经 `EventError` 旁路捕捉不阻断。
 
-详见 [AGENTS.md](AGENTS.md) 第 3、4 节。
+详见 [AGENTS.md](AGENTS.md) 第 3、4、5 节。
 
 ## 验收
 
@@ -76,7 +78,7 @@ go run . run -prompt "hello"
 - ✅ `go vet ./...` 0 warnings
 - ✅ `gofmt -l .` 0 files
 - ✅ `golangci-lint run ./...` 0 issues
-- ✅ `go test ./...` 全绿（钩子分发 / 事件发布 / 错误回传 / panic 恢复）
+- ✅ `go test ./...` 全绿（24 个测试：16 钩子全触发 / 17 事件全发布 / 错误回传 / panic 恢复 / 致命终止 / 改写数据）
 - ✅ Entity 层仅依赖 Go 标准库
 
 ## 下一步

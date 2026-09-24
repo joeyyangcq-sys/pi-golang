@@ -17,18 +17,40 @@ import "context"
 type EventType string
 
 const (
+	// EventRunStart 在 Execute 刚进入、任何前置校验之前发布。
+	EventRunStart EventType = "run.start"
+	// EventRunValidated 在入参/后端存在性校验全部通过后发布。
+	EventRunValidated EventType = "run.validated"
 	// EventTurnStart 在一次会话开始、构造对话之前发布。
 	EventTurnStart EventType = "turn.start"
-	// EventTurnEnd 在 Execute 返回前（成功/失败/取消均触发）发布。
-	EventTurnEnd EventType = "turn.end"
+	// EventConversationBuilt 在初始对话（system+user）构造完成后发布。
+	EventConversationBuilt EventType = "conversation.built"
+	// EventIterationStart 在每轮 LLM→tool 循环迭代开始（i 递增后、ctx 检查前）发布。
+	EventIterationStart EventType = "iteration.start"
+	// EventCtxCancelled 在 ctx.Done() 被触发时发布，随后 Execute 返回。
+	EventCtxCancelled EventType = "ctx.cancelled"
 	// EventLLMBefore 在每次 LLM.Chat 调用之前发布。
 	EventLLMBefore EventType = "llm.before"
 	// EventLLMAfter 在每次 LLM.Chat 成功返回之后发布。
 	EventLLMAfter EventType = "llm.after"
+	// EventFinalAnswer 在 LLM 不再需要工具、准备返回最终答案时发布。
+	EventFinalAnswer EventType = "final.answer"
+	// EventToolLookup 在按名查找工具之前发布。
+	EventToolLookup EventType = "tool.lookup"
+	// EventToolNotFound 在按名查找工具失败时发布。
+	EventToolNotFound EventType = "tool.notfound"
 	// EventToolBefore 在每次 Tool.Call 之前发布。
 	EventToolBefore EventType = "tool.before"
 	// EventToolAfter 在每次 Tool.Call 返回之后发布（不论成功失败）。
 	EventToolAfter EventType = "tool.after"
+	// EventToolReplyAppended 在工具结果 ToolReply 追加进对话后发布。
+	EventToolReplyAppended EventType = "tool.reply.appended"
+	// EventIterationEnd 在一轮迭代结束（所有工具处理完、切回 Thinking 后）发布。
+	EventIterationEnd EventType = "iteration.end"
+	// EventMaxIterations 在达到 MaxIterations 而未拿到最终答案时发布。
+	EventMaxIterations EventType = "iteration.max"
+	// EventTurnEnd 在 Execute 返回前（成功/失败/取消/超迭代均触发）发布。
+	EventTurnEnd EventType = "turn.end"
 	// EventError 在任意环节出现错误时发布，Err 字段携带错误详情。
 	// 这是"每个工具和插件的报错都能被捕捉"的关键出口：所有错误都会
 	// 经由这里广播给订阅者，同时工具路径上的错误还会以 ToolReply 回传 LLM。
