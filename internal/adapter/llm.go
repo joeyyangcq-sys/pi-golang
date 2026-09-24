@@ -1,8 +1,7 @@
-// Package adapter contains the Interface Adapters layer of Clean Architecture.
+// Package adapter 包含 Clean Architecture 的接口适配层。
 //
-// Types here bridge between the pure-go Entity/Usecase inner layers and the
-// concrete outer implementations (HTTP clients, database drivers, etc.)
-// living in the Infrastructure layer.
+// 这里的类型在内层（Entity/Usecase）与外层具体实现（HTTP 客户端、
+// 数据库驱动等，位于 Infrastructure 层）之间做桥接。
 package adapter
 
 import (
@@ -11,34 +10,33 @@ import (
 	"pi-golang/internal/entity"
 )
 
-// LLMProvider is the vendor-agnostic adapter we require from every LLM
-// vendor. It is intentionally identical to entity.LLM; the duplication
-// documents the seam so later refactors can add DTO→Entity conversion
-// logic here without modifying anything inside entity/.
+// LLMProvider 是我们对每个 LLM 供应商要求的厂商无关适配器接口。
+// 它刻意与 entity.LLM 一致；这份"重复"是为了显式标注接缝，便于
+// 后续在此添加 DTO→Entity 转换逻辑而不改动 entity/ 内任何代码。
 type LLMProvider interface {
 	entity.LLM
 	DefaultModel() string
 }
 
-// BaseProvider bundles the common fields every LLM provider needs.
-// Concrete providers embed this struct.
+// BaseProvider 打包每个 LLM provider 都需要的公共字段。具体 provider
+// 通过嵌入本结构体复用。
 type BaseProvider struct {
 	APIKey         string
 	BaseURL        string
 	DefaultModelID string
 }
 
-// DefaultModel returns the configured default model id.
+// DefaultModel 返回配置的默认模型 id。
 func (b BaseProvider) DefaultModel() string { return b.DefaultModelID }
 
-// OpenAIProvider is the placeholder for the real OpenAI/OpenRouter adapter.
-// The Chat method currently returns entity.ErrNotImplemented; wire this up
-// to an HTTP client once you are ready to hit live endpoints.
+// OpenAIProvider 是 OpenAI/OpenRouter 适配器的占位实现。
+// Chat 目前返回 entity.ErrNotImplemented；接真实端点时把本方法换成
+// 真实 HTTP 调用即可。
 type OpenAIProvider struct {
 	BaseProvider
 }
 
-// NewOpenAI constructs an OpenAIProvider with the given credentials.
+// NewOpenAI 用给定凭证构造 OpenAIProvider。
 func NewOpenAI(apiKey, baseURL, defaultModel string) *OpenAIProvider {
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
@@ -50,17 +48,17 @@ func NewOpenAI(apiKey, baseURL, defaultModel string) *OpenAIProvider {
 	}}
 }
 
-// Chat is the placeholder implementation.
+// Chat 是占位实现。
 func (*OpenAIProvider) Chat(context.Context, entity.ChatRequest) (entity.ChatResponse, error) {
 	return entity.ChatResponse{}, entity.ErrNotImplemented
 }
 
-// AnthropicProvider is the analogous placeholder for Claude endpoints.
+// AnthropicProvider 是 Claude 端点的同类占位实现。
 type AnthropicProvider struct {
 	BaseProvider
 }
 
-// NewAnthropic constructs an AnthropicProvider with the given credentials.
+// NewAnthropic 用给定凭证构造 AnthropicProvider。
 func NewAnthropic(apiKey, baseURL, defaultModel string) *AnthropicProvider {
 	if baseURL == "" {
 		baseURL = "https://api.anthropic.com/v1"
@@ -72,7 +70,7 @@ func NewAnthropic(apiKey, baseURL, defaultModel string) *AnthropicProvider {
 	}}
 }
 
-// Chat is the placeholder implementation.
+// Chat 是占位实现。
 func (*AnthropicProvider) Chat(context.Context, entity.ChatRequest) (entity.ChatResponse, error) {
 	return entity.ChatResponse{}, entity.ErrNotImplemented
 }

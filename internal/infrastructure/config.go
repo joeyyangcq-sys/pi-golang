@@ -1,5 +1,5 @@
-// Package infrastructure contains the concrete outermost implementations
-// (configuration loaders, in-memory stores, DI assembly, loggers).
+// Package infrastructure 包含最外层的具体实现（配置加载、内存存储、
+// DI 组装、日志器）。
 package infrastructure
 
 import (
@@ -9,15 +9,15 @@ import (
 	"strings"
 )
 
-// LLMConfig holds LLM provider settings.
+// LLMConfig 持有 LLM 供应商设置。
 type LLMConfig struct {
-	Provider string // "openai", "openrouter", or "anthropic"
+	Provider string // "openai" | "openrouter" | "anthropic"
 	APIKey   string
 	BaseURL  string
 	Model    string
 }
 
-// AgentConfig holds Agent-specific configuration.
+// AgentConfig 持有 Agent 相关配置。
 type AgentConfig struct {
 	Name          string
 	SystemPrompt  string
@@ -25,21 +25,20 @@ type AgentConfig struct {
 	MaxIterations int
 }
 
-// LogConfig controls the logger.
+// LogConfig 控制日志器。
 type LogConfig struct {
 	Level string // debug | info | warn | error
 }
 
-// Config aggregates every application setting loaded from the environment.
+// Config 聚合从环境变量加载的全部应用设置。
 type Config struct {
 	LLM   LLMConfig
 	Agent AgentConfig
 	Log   LogConfig
 }
 
-// Load reads configuration from environment variables and applies defaults.
-// Missing values are silently replaced with sensible defaults; only
-// genuine misconfigurations (like negative temperature) produce errors.
+// Load 从环境变量读取配置并应用默认值。缺失值会被合理默认值替换；
+// 只有真正的配置错误（如负温度）才报错。
 func Load() (Config, error) {
 	cfg := Config{
 		LLM: LLMConfig{
@@ -61,13 +60,13 @@ func Load() (Config, error) {
 	return cfg, cfg.Validate()
 }
 
-// Validate reports any obviously-invalid configuration.
+// Validate 报告明显非法的配置。
 func (c Config) Validate() error {
 	if c.Agent.Temperature < 0 || c.Agent.Temperature > 2 {
-		return errors.New("config: AGENT_TEMPERATURE must be between 0 and 2")
+		return errors.New("config: AGENT_TEMPERATURE 必须在 0 到 2 之间")
 	}
 	if c.Agent.MaxIterations < 1 {
-		return errors.New("config: AGENT_MAX_ITERATIONS must be >= 1")
+		return errors.New("config: AGENT_MAX_ITERATIONS 必须 >= 1")
 	}
 	return nil
 }

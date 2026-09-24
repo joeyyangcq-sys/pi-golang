@@ -4,57 +4,50 @@ import (
 	"context"
 	"sync"
 
-	"pi-golang/internal/adapter"
 	"pi-golang/internal/entity"
 )
 
-// Compile-time assertion: in-memory plugin state store satisfies the
-// adapter memory seam and the entity PluginStateStore seam.
-var (
-	_ adapter.MemoryStore       = (*InMemoryMemory)(nil)
-	_ entity.PluginStateStore   = (*InMemoryPluginState)(nil)
-)
+// 编译期断言：*InMemoryPluginState 满足 entity.PluginStateStore。
+var _ entity.PluginStateStore = (*InMemoryPluginState)(nil)
 
-// InMemoryPluginState is a thread-safe, process-lifetime implementation of
-// entity.PluginStateStore. It mirrors the shape of pi's per-plugin
-// RewindableState.plugins namespace — a future durable layer can swap in a
-// fork/rewind-aware store without changing any plugin's code.
+// InMemoryPluginState 是进程内、线程安全的插件命名空间状态存储。
+// 每个插件一个独立 map，存活于 Agent 生命周期。用于需要跨环节/跨轮
+// 记忆状态的扩展（如计数器、缓存、会话级标记）。
 type InMemoryPluginState struct {
 	mu   sync.RWMutex
 	data map[entity.PluginID]map[string]any
 }
 
-// NewInMemoryPluginState returns an empty, ready-to-use in-memory plugin store.
+// NewInMemoryPluginState 返回一个空的插件状态存储。
 func NewInMemoryPluginState() *InMemoryPluginState {
 	return &InMemoryPluginState{data: make(map[entity.PluginID]map[string]any)}
 }
 
-// GetState returns a *copy* of the plugin's current state map so the caller
-// can mutate their local copy without racing against other hooks. Plugins
-// should always call SetState to persist any mutations.
+// GetState 返回某扩展当前的状态 map。插件从未写过状态时返回空 map
+// （绝不 nil）——插件无需 nil 检查。
 func (s *InMemoryPluginState) GetState(_ context.Context, id entity.PluginID) (map[string]any, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	raw, ok := s.data[id]
+	v, ok := s.data[id]
 	if !ok {
 		return map[string]any{}, nil
 	}
-	out := make(map[string]any, len(raw))
-	for k, v := range raw {
-		out[k] = v
+	// 返回副本，避免外部直接改内部状态。
+	out := make(map[string]any, len(v))
+	for k, val := range v {
+		out[k] = val
 	}
 	return out, nil
 }
 
-// SetState replaces the plugin's state map with a *copy* of the caller's map
-// so internal storage is safe from subsequent mutation by the caller.
+// SetState 替换某扩展的状态 map（全快照语义，与 Pi 的 PluginSlices 一致）。
 func (s *InMemoryPluginState) SetState(_ context.Context, id entity.PluginID, state map[string]any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	cp := make(map[string]any, len(state))
 	for k, v := range state {
 		cp[k] = v
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	s.data[id] = cp
 	return nil
 }

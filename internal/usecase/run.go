@@ -1,9 +1,14 @@
-// Package usecase implements the application-level business logic.
+// Package usecase 实现应用层业务逻辑。
 //
-// This minimal skeleton ships a single use case: RunUsecase, which drives
-// one full "user prompt → extension hooks → LLM → optional tool calls →
-// → extension hooks → final answer" loop. The 6-phase hook system mirrors
-// pi's core extension model (plugin kinds + coding-agent extension hooks).
+// 本精简骨架只提供一个用例：RunUsecase，驱动一次完整的
+// "用户 prompt → LLM → 可选工具调用 → 最终答案"循环。
+//
+// 本文件同时是插件/事件机制与错误回传策略的"编排中心"：
+//   - 在循环的每个环节按需类型断言并触发 6 个阶段钩子（可改主流程数据）；
+//   - 在每个环节向 EventBus 发布事件（只读观察旁路）；
+//   - 工具路径上的所有错误（Call 报错、panic、OnToolBefore 拒绝、
+//     工具未找到）都转成 ToolReply 追加进对话，回传给 LLM；
+//   - 其余环节的钩子错误经 EventBus 广播 + 日志记录，不阻断主流程。
 package usecase
 
 import (
@@ -16,10 +21,8 @@ import (
 	"pi-golang/internal/entity"
 )
 
-// Logger is the narrow port the usecase layer accepts for observability.
-// Declared here (rather than imported from a separate package) keeps the
-// usecase layer fully self-contained and free of outbound dependencies
-// beyond std + entity.
+// Logger 是 usecase 层接受的观测端口。在此声明（而非从单独包导入）
+// 让 usecase 层完全自包含，除 std + entity 外无出向依赖。
 type Logger interface {
 	Debug(ctx context.Context, msg string, args ...any)
 	Info(ctx context.Context, msg string, args ...any)
@@ -27,357 +30,359 @@ type Logger interface {
 	Error(ctx context.Context, msg string, args ...any)
 }
 
-// RunInput is the single, minimal argument bag for RunUsecase.Execute.
+// RunInput 是 RunUsecase.Execute 的入参包。
 type RunInput struct {
-	// UserPrompt is the text the user just typed.
+	// UserPrompt 是用户刚输入的文本。
 	UserPrompt string
 }
 
-// RunOutput is the result of a successful agent run.
+// RunOutput 是一次成功 Agent 运行的结果。
 type RunOutput struct {
-	// FinalAnswer is the assistant text to show to the user.
+	// FinalAnswer 是要展示给用户的助手文本。
 	FinalAnswer string
-	// Iterations counts how many LLM→tool loops were executed.
+	// Iterations 记录执行了多少轮 LLM→工具 循环。
 	Iterations int
-	// Elapsed is the wall-clock time spent in the usecase.
+	// Elapsed 是 usecase 内的墙钟耗时。
 	Elapsed time.Duration
 }
 
-// RunUsecase encapsulates the dependencies of the "run the agent once"
-// application use case. Plugins is the ordered list of extensions that
-// fire at each of the 6 hook phases.
+// RunUsecase 封装"运行 Agent 一次"用例的依赖。
 type RunUsecase struct {
-	Logger  Logger
-	Plugins []entity.Plugin
+	Logger Logger
 }
 
-// NewRunUsecase returns a RunUsecase wired with the given logger and
-// plugin list. Nil values are replaced with safe defaults so callers
-// never need to nil-check.
-func NewRunUsecase(log Logger, plugins ...entity.Plugin) *RunUsecase {
+// NewRunUsecase 用给定 logger 构造 RunUsecase。log 为 nil 时使用 no-op
+// logger，调用方无需 nil 检查。
+func NewRunUsecase(log Logger) *RunUsecase {
 	if log == nil {
 		log = nopLog{}
 	}
-	return &RunUsecase{Logger: log, Plugins: plugins}
+	return &RunUsecase{Logger: log}
 }
 
-// Execute drives the full agent loop with 6-phase extension hooks:
+// Execute 驱动完整 Agent 循环：构造对话 → 调 LLM → 分发工具调用 →
+// 重复直到 LLM 不再要工具或达到 MaxIterations。
 //
-//	TurnStart → [ (LLMBefore → LLM → LLMAfter) → (ToolBefore → Tool → ToolAfter) ]*N → TurnEnd
+// 每个环节都会触发对应阶段钩子 + 发布事件，详见 entity/plugin.go
+// 顶部文档与 entity/event.go。
 func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput) (out RunOutput, err error) {
 	started := time.Now()
 	defer func() { out.Elapsed = time.Since(started) }()
 
 	if a == nil {
-		return out, errors.New("usecase: agent is nil")
+		return out, errors.New("usecase: agent 为 nil")
 	}
 	if a.LLM() == nil {
 		return out, entity.ErrLLMNotConfigured
 	}
 
-	// Merge extension tools once, up front. Tool lookup in the loop uses
-	// this merged view, matching pi's coding-agent "extensions may ship
-	// their own tools" contract.
-	mergedTools := mergeTools(a.Tools(), uc.toolsFromPlugins())
-
 	cfg := a.Config()
+	plugins := a.Plugins()
+	bus := a.EventBus()
+
+	// === TurnStart 阶段 ===
 	a.SetState(entity.AgentThinking)
-
-	// ── Phase 1: TurnStart hooks — can rewrite user prompt ──────────
-	turnInfo := entity.TurnStartInfo{UserPrompt: in.UserPrompt}
-	turnInfo, err = uc.runTurnStartHooks(ctx, a, turnInfo)
-	if err != nil {
-		// Phase 6 (TurnEnd) must run on *every* terminal path, including errors.
-		defer uc.runTurnEndHooks(ctx, a, entity.TurnEndInfo{
-			FinalAnswer: out.FinalAnswer, Iterations: out.Iterations, Err: err,
-		})
-		return out, fmt.Errorf("usecase: plugin TurnStart: %w", err)
-	}
-	in.UserPrompt = turnInfo.UserPrompt
-
-	// ── Ensure TurnEnd fires on the happy path and on any return below ─
-	defer func() {
-		_, endErr := uc.runTurnEndHooks(ctx, a, entity.TurnEndInfo{
-			FinalAnswer: out.FinalAnswer, Iterations: out.Iterations, Err: err,
-		})
-		if endErr != nil && err == nil {
-			err = fmt.Errorf("usecase: plugin TurnEnd: %w", endErr)
+	turnStartInfo := entity.TurnStartInfo{UserPrompt: in.UserPrompt, Iteration: 0}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventTurnStart, Payload: turnStartInfo})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithTurnStart)
+		if !ok {
+			continue
 		}
-	}()
+		modified, herr := runHook(uc, ctx, p.ID(), "turn.start", func() (entity.TurnStartInfo, error) {
+			return h.OnTurnStart(ctx, a, turnStartInfo)
+		}, bus)
+		if herr != nil {
+			// TurnStart 错误视为致命：会话尚未真正开始，直接终止。
+			a.SetState(entity.AgentError)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: 0, Err: herr})
+			return out, fmt.Errorf("usecase: turn.start 钩子 %s: %w", p.ID(), herr)
+		}
+		turnStartInfo = modified
+	}
 
+	prompt := turnStartInfo.UserPrompt
+	if prompt == "" {
+		prompt = in.UserPrompt
+	}
+
+	// 构造对话
 	conv := entity.Conversation{}
 	if cfg.SystemPrompt != "" {
 		conv = conv.Append(entity.System(cfg.SystemPrompt))
 	}
-	conv = conv.Append(entity.User(in.UserPrompt))
+	conv = conv.Append(entity.User(prompt))
 
-	uc.Logger.Info(ctx, "starting agent run",
-		"agent", cfg.Name,
-		"iterations", cfg.MaxIterations,
-		"tools", len(mergedTools),
-		"plugins", len(uc.Plugins),
-	)
+	uc.Logger.Info(ctx, "开始 agent 运行", "agent", cfg.Name,
+		"iterations", cfg.MaxIterations, "tools", len(a.Tools()), "plugins", len(plugins))
 
 	model := cfg.Model
 	if model == "" {
 		model = defaultModelOf(a.LLM())
 	}
+	tools := a.Tools()
 
 	for i := 0; i < cfg.MaxIterations; i++ {
 		out.Iterations = i + 1
 		select {
 		case <-ctx.Done():
 			a.SetState(entity.AgentError)
-			err = ctx.Err()
-			return out, err
+			uc.publishError(bus, ctx, "ctx", ctx.Err())
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: ctx.Err()})
+			return out, ctx.Err()
 		default:
 		}
 
-		// ── Phase 2: LLMBefore hooks — can rewrite request ────────
+		// === LLMBefore 阶段 ===
 		req := entity.ChatRequest{
 			Model:       model,
 			Messages:    conv,
 			Temperature: cfg.Temperature,
-			Tools:       toolInfos(mergedTools),
+			Tools:       toolInfos(tools),
 		}
-		req, err = uc.runLLMBeforeHooks(ctx, a, req)
-		if err != nil {
-			a.SetState(entity.AgentError)
-			return out, fmt.Errorf("usecase: iteration %d: plugin LLMBefore: %w", i+1, err)
+		for _, p := range plugins {
+			h, ok := p.(entity.WithLLMBefore)
+			if !ok {
+				continue
+			}
+			modified, herr := runHook(uc, ctx, p.ID(), "llm.before", func() (entity.ChatRequest, error) {
+				return h.OnLLMBefore(ctx, a, req)
+			}, bus)
+			if herr != nil {
+				// 非致命：记录并继续用原请求，避免一个插件搞挂 LLM 调用。
+				uc.Logger.Warn(ctx, "llm.before 钩子错误，使用原请求",
+					"plugin", p.ID(), "err", herr)
+				continue
+			}
+			req = modified
 		}
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMBefore, Payload: req})
 
-		resp, llmErr := a.LLM().Chat(ctx, req)
-		if llmErr != nil {
+		// === LLM 调用 ===
+		resp, lerr := a.LLM().Chat(ctx, req)
+		if lerr != nil {
 			a.SetState(entity.AgentError)
-			err = fmt.Errorf("usecase: iteration %d: llm: %w", i+1, llmErr)
-			return out, err
+			uc.publishError(bus, ctx, "llm.chat", lerr)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: lerr})
+			return out, fmt.Errorf("usecase: 第 %d 轮: llm: %w", i+1, lerr)
 		}
-		uc.Logger.Debug(ctx, "llm reply", "iter", i+1,
+		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
 			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content))
 
-		// ── Phase 3: LLMAfter hooks — can rewrite response ────────
-		resp, err = uc.runLLMAfterHooks(ctx, a, req, resp)
-		if err != nil {
-			a.SetState(entity.AgentError)
-			return out, fmt.Errorf("usecase: iteration %d: plugin LLMAfter: %w", i+1, err)
+		// === LLMAfter 阶段 ===
+		for _, p := range plugins {
+			h, ok := p.(entity.WithLLMAfter)
+			if !ok {
+				continue
+			}
+			modified, herr := runHook(uc, ctx, p.ID(), "llm.after", func() (entity.ChatResponse, error) {
+				return h.OnLLMAfter(ctx, a, req, resp)
+			}, bus)
+			if herr != nil {
+				uc.Logger.Warn(ctx, "llm.after 钩子错误，使用原响应",
+					"plugin", p.ID(), "err", herr)
+				continue
+			}
+			resp = modified
 		}
+		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMAfter, Payload: resp})
 
 		if len(resp.ToolCalls) == 0 {
-			conv = conv.Append(entity.Assistant(resp.Content))
 			out.FinalAnswer = resp.Content
 			a.SetState(entity.AgentDone)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
+				FinalAnswer: out.FinalAnswer, Iterations: i + 1, Err: nil,
+			})
 			return out, nil
 		}
 
 		a.SetState(entity.AgentActing)
 		conv = conv.Append(entity.Assistant(resp.Content))
 
+		// === 工具阶段 ===
 		for _, tc := range resp.ToolCalls {
-			t := findTool(mergedTools, tc.Name)
-			if t == nil {
-				msg := fmt.Sprintf("tool %q not found; no action taken", tc.Name)
-				uc.Logger.Warn(ctx, "tool lookup failed", "tool", tc.Name)
-				conv = conv.Append(entity.ToolReply(tc.Name, msg))
-				continue
-			}
-
-			toolReq := entity.Request{Name: tc.Name, Arguments: json.RawMessage(tc.Arguments)}
-
-			// ── Phase 4: ToolBefore hooks ────────────────────────
-			toolReq, err = uc.runToolBeforeHooks(ctx, a, t, toolReq)
-			if err != nil {
-				uc.Logger.Warn(ctx, "tool aborted by plugin ToolBefore",
-					"tool", tc.Name, "err", err.Error())
-				conv = conv.Append(entity.ToolReply(tc.Name, "tool aborted: "+err.Error()))
-				continue
-			}
-
-			result := t.Call(ctx, toolReq)
-			if result.IsError {
-				uc.Logger.Warn(ctx, "tool returned error",
-					"tool", tc.Name, "content", truncate(result.Content, 200))
-			}
-
-			// ── Phase 5: ToolAfter hooks ─────────────────────────
-			result, err = uc.runToolAfterHooks(ctx, a, t, toolReq, result)
-			if err != nil {
-				uc.Logger.Warn(ctx, "plugin ToolAfter returned error",
-					"tool", tc.Name, "err", err.Error())
-				conv = conv.Append(entity.ToolReply(tc.Name, "tool post-hook error: "+err.Error()))
-				continue
-			}
-			conv = conv.Append(entity.ToolReply(tc.Name, result.Content))
+			conv = uc.dispatchTool(ctx, a, plugins, bus, tools, tc, conv)
 		}
 
 		a.SetState(entity.AgentThinking)
 	}
 
+	// 达到 MaxIterations 仍无最终答案，用最后一条消息兜底
 	last := conv.Last()
 	out.FinalAnswer = last.Content
 	a.SetState(entity.AgentDone)
-	uc.Logger.Warn(ctx, "agent loop reached MaxIterations without final answer",
+	uc.Logger.Warn(ctx, "agent 循环达到 MaxIterations 仍未得到最终答案",
 		"max", cfg.MaxIterations)
+	uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
+		FinalAnswer: out.FinalAnswer, Iterations: cfg.MaxIterations, Err: nil,
+	})
 	return out, nil
 }
 
-// -------------------- Plugin hook dispatch helpers --------------------
-
-func (uc *RunUsecase) runTurnStartHooks(ctx context.Context, a *entity.Agent, info entity.TurnStartInfo) (entity.TurnStartInfo, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithTurnStart); ok {
-			info, err = impl.OnTurnStart(ctx, a, info)
-			if err != nil {
-				return info, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
+// dispatchTool 处理一次工具调用：查找工具 → ToolBefore 钩子 →
+// Call（含 panic 恢复）→ ToolAfter 钩子 → 追加 ToolReply。
+// 所有错误路径都把错误信息作为 ToolReply 追加进对话回传 LLM。
+// 返回追加后的新对话。
+func (uc *RunUsecase) dispatchTool(
+	ctx context.Context,
+	a *entity.Agent,
+	plugins []entity.Plugin,
+	bus entity.EventBus,
+	tools []entity.Tool,
+	tc entity.ToolCall,
+	conv entity.Conversation,
+) entity.Conversation {
+	t := findToolByName(tools, tc.Name)
+	if t == nil {
+		msg := fmt.Sprintf("工具 %q 未找到，未执行任何动作", tc.Name)
+		uc.Logger.Warn(ctx, "工具查找失败", "tool", tc.Name)
+		uc.publishError(bus, ctx, "tool.lookup", entity.ErrToolNotFound)
+		return conv.Append(entity.ToolReply(tc.Name, msg))
 	}
-	return info, nil
-}
 
-func (uc *RunUsecase) runTurnEndHooks(ctx context.Context, a *entity.Agent, info entity.TurnEndInfo) (entity.TurnEndInfo, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithTurnEnd); ok {
-			info, err = impl.OnTurnEnd(ctx, a, info)
-			if err != nil {
-				return info, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
+	toolReq := entity.Request{
+		Name:      tc.Name,
+		Arguments: json.RawMessage(tc.Arguments),
 	}
-	return info, nil
-}
 
-func (uc *RunUsecase) runLLMBeforeHooks(ctx context.Context, a *entity.Agent, req entity.ChatRequest) (entity.ChatRequest, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithLLMBefore); ok {
-			req, err = impl.OnLLMBefore(ctx, a, req)
-			if err != nil {
-				return req, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
-	}
-	return req, nil
-}
-
-func (uc *RunUsecase) runLLMAfterHooks(ctx context.Context, a *entity.Agent, req entity.ChatRequest, resp entity.ChatResponse) (entity.ChatResponse, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithLLMAfter); ok {
-			resp, err = impl.OnLLMAfter(ctx, a, req, resp)
-			if err != nil {
-				return resp, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
-	}
-	return resp, nil
-}
-
-func (uc *RunUsecase) runToolBeforeHooks(ctx context.Context, a *entity.Agent, t entity.Tool, r entity.Request) (entity.Request, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithToolBefore); ok {
-			r, err = impl.OnToolBefore(ctx, a, t, r)
-			if err != nil {
-				return r, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
-	}
-	return r, nil
-}
-
-func (uc *RunUsecase) runToolAfterHooks(ctx context.Context, a *entity.Agent, t entity.Tool, r entity.Request, res entity.Result) (entity.Result, error) {
-	var err error
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithToolAfter); ok {
-			res, err = impl.OnToolAfter(ctx, a, t, r, res)
-			if err != nil {
-				return res, fmt.Errorf("plugin %s: %w", p.ID(), err)
-			}
-		}
-	}
-	return res, nil
-}
-
-// toolsFromPlugins returns the deduplicated list of tools shipped by
-// plugins that implement WithRegisterTools. Last-writer-wins on duplicate
-// names (matches pi's coding-agent extension tools merging rule).
-func (uc *RunUsecase) toolsFromPlugins() []entity.Tool {
-	var out []entity.Tool
-	seen := make(map[string]bool)
-	for _, p := range uc.Plugins {
-		if impl, ok := p.(entity.WithRegisterTools); ok {
-			for _, t := range impl.RegisterTools() {
-				name := t.Info().Name
-				if seen[name] {
-					// last-writer-wins: strip the previous occurrence
-					for i := range out {
-						if out[i].Info().Name == name {
-							out = append(out[:i], out[i+1:]...)
-							break
-						}
-					}
-				}
-				seen[name] = true
-				out = append(out, t)
-			}
-		}
-	}
-	return out
-}
-
-// mergeTools combines the agent's native tools with plugin-supplied tools.
-// Plugin tools are appended *after* native ones, so duplicate names win on
-// the plugin side (the last entry in the returned slice is what FindTool
-// will match — we iterate forward and return the first match, so in case of
-// conflict we place the plugin copy *before* the native copy to preserve
-// the documented last-writer-wins semantics of toolsFromPlugins).
-func mergeTools(native, fromPlugins []entity.Tool) []entity.Tool {
-	nativeNames := make(map[string]struct{}, len(native))
-	for _, t := range native {
-		nativeNames[t.Info().Name] = struct{}{}
-	}
-	merged := make([]entity.Tool, 0, len(fromPlugins)+len(native))
-	// Plugin tools first so they override native names in findTool's
-	// first-match linear scan (matches pi coding-agent last-writer-wins).
-	merged = append(merged, fromPlugins...)
-	for _, t := range native {
-		// If a plugin already shipped a tool with the same name, drop the
-		// native copy — last-writer (plugin) wins.
-		if _, dup := nameIn(fromPlugins, t.Info().Name); dup {
+	// ToolBefore：钩子可改请求；返回 err 则拒绝该工具，错误回传 LLM。
+	blocked := false
+	for _, p := range plugins {
+		h, ok := p.(entity.WithToolBefore)
+		if !ok {
 			continue
 		}
-		_ = nativeNames
-		merged = append(merged, t)
+		modified, herr := runHook(uc, ctx, p.ID(), "tool.before", func() (entity.Request, error) {
+			return h.OnToolBefore(ctx, a, t, toolReq)
+		}, bus)
+		if herr != nil {
+			msg := fmt.Sprintf("工具被插件 %s 拒绝: %v", p.ID(), herr)
+			uc.Logger.Warn(ctx, "tool.before 钩子拒绝工具",
+				"tool", tc.Name, "plugin", p.ID(), "err", herr)
+			conv = conv.Append(entity.ToolReply(tc.Name, msg))
+			blocked = true
+			break
+		}
+		toolReq = modified
 	}
-	return merged
+	if blocked {
+		return conv
+	}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolBefore, Payload: toolReq})
+
+	// Tool.Call（带 panic 恢复）
+	result := uc.callToolSafe(ctx, t, toolReq)
+	if result.IsError {
+		uc.Logger.Warn(ctx, "工具返回错误",
+			"tool", tc.Name, "content", truncate(result.Content, 200))
+		uc.publishError(bus, ctx, "tool.call", errors.New(result.Content))
+	}
+
+	// ToolAfter：钩子可改结果；错误仅记录，用原结果继续。
+	for _, p := range plugins {
+		h, ok := p.(entity.WithToolAfter)
+		if !ok {
+			continue
+		}
+		modified, herr := runHook(uc, ctx, p.ID(), "tool.after", func() (entity.Result, error) {
+			return h.OnToolAfter(ctx, a, t, toolReq, result)
+		}, bus)
+		if herr != nil {
+			uc.Logger.Warn(ctx, "tool.after 钩子错误，使用原结果",
+				"plugin", p.ID(), "err", herr)
+			continue
+		}
+		result = modified
+	}
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolAfter, Payload: result})
+
+	return conv.Append(entity.ToolReply(tc.Name, result.Content))
 }
 
-func nameIn(tools []entity.Tool, name string) (int, bool) {
-	for i, t := range tools {
-		if t.Info().Name == name {
-			return i, true
+// callToolSafe 调用 Tool.Call 并 recover 任意 panic，转成错误 Result。
+// 这保证一个崩溃的工具不会拖垮整个 Agent，且错误信息能回传 LLM。
+func (uc *RunUsecase) callToolSafe(ctx context.Context, t entity.Tool, r entity.Request) (result entity.Result) {
+	defer func() {
+		if rc := recover(); rc != nil {
+			result = entity.Result{
+				Content: fmt.Sprintf("工具 panic: %v", rc),
+				IsError: true,
+			}
+			uc.Logger.Error(ctx, "工具 panic 已恢复",
+				"tool", r.Name, "panic", rc)
+		}
+	}()
+	return t.Call(ctx, r)
+}
+
+// runHook 安全执行一个钩子调用：recover panic + 发布错误事件。
+// 使用命名返回值以便 defer 内 recover 时能把 panic 转成 err 返回
+// （否则 panic 会被吞掉、误当成功）。phase 用于日志与事件。
+// panic 时返回 T 的零值 + 非 nil 错误；调用方约定仅在 err==nil 时
+// 才使用返回的 T，故零值不会污染主流程。
+//
+// 注：Go 方法不允许带类型参数，故这里用包级泛型函数，并把 uc 作为
+// 首参传入以复用其 Logger 与 publishError。
+func runHook[T any](
+	uc *RunUsecase,
+	ctx context.Context,
+	id entity.PluginID,
+	phase string,
+	fn func() (T, error),
+	bus entity.EventBus,
+) (res T, err error) {
+	defer func() {
+		if rc := recover(); rc != nil {
+			err = fmt.Errorf("钩子 %s 在 %s 阶段 panic: %v", id, phase, rc)
+			uc.Logger.Error(ctx, "钩子 panic 已恢复",
+				"plugin", id, "phase", phase, "panic", rc)
+			uc.publishError(bus, ctx, phase, err)
+		}
+	}()
+	res, err = fn()
+	return res, err
+}
+
+// runTurnEnd 触发所有 OnTurnEnd 钩子并发布 TurnEnd 事件。
+// 在 Execute 的每条终止路径上调用。钩子错误仅记录。
+func (uc *RunUsecase) runTurnEnd(
+	plugins []entity.Plugin,
+	bus entity.EventBus,
+	ctx context.Context,
+	a *entity.Agent,
+	info entity.TurnEndInfo,
+) {
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventTurnEnd, Payload: info})
+	for _, p := range plugins {
+		h, ok := p.(entity.WithTurnEnd)
+		if !ok {
+			continue
+		}
+		_, herr := runHook(uc, ctx, p.ID(), "turn.end", func() (entity.TurnEndInfo, error) {
+			return h.OnTurnEnd(ctx, a, info)
+		}, bus)
+		if herr != nil {
+			uc.Logger.Warn(ctx, "turn.end 钩子错误", "plugin", p.ID(), "err", herr)
 		}
 	}
-	return -1, false
 }
 
-// findTool replaces Agent.FindTool so we use the merged (native + plugin)
-// tool pool instead of just the agent's native set.
-func findTool(tools []entity.Tool, name string) entity.Tool {
-	for _, t := range tools {
-		if t.Info().Name == name {
-			return t
-		}
+// publish 向事件总线发布事件；bus 为 nil 时跳过。
+func (uc *RunUsecase) publish(bus entity.EventBus, ctx context.Context, e entity.Event) {
+	if bus == nil {
+		return
 	}
-	return nil
+	bus.Publish(ctx, e)
 }
 
-// -------------------- Small pure helpers --------------------
+// publishError 发布一个 EventError 事件并记录日志。
+func (uc *RunUsecase) publishError(bus entity.EventBus, ctx context.Context, phase string, err error) {
+	uc.Logger.Error(ctx, "环节错误", "phase", phase, "err", err)
+	uc.publish(bus, ctx, entity.Event{Type: entity.EventError, Payload: phase, Err: err})
+}
 
-// defaultModelOf probes an entity.LLM for the optional DefaultModel()
-// method; returns empty string if unsupported.
+// defaultModelOf 探测 entity.LLM 是否实现可选的 DefaultModel() 方法；
+// 不支持则返回空串。
 func defaultModelOf(l entity.LLM) string {
 	type withDefaultModel interface {
 		DefaultModel() string
@@ -388,7 +393,7 @@ func defaultModelOf(l entity.LLM) string {
 	return ""
 }
 
-// toolInfos extracts Info() for each tool in order. Returns nil when empty.
+// toolInfos 按序提取每个工具的 Info()。空时返回 nil。
 func toolInfos(tools []entity.Tool) []entity.Info {
 	if len(tools) == 0 {
 		return nil
@@ -400,7 +405,17 @@ func toolInfos(tools []entity.Tool) []entity.Info {
 	return out
 }
 
-// truncate shortens very long strings for safe log emission.
+// findToolByName 在工具列表里按名查找，找不到返回 nil。
+func findToolByName(tools []entity.Tool, name string) entity.Tool {
+	for _, t := range tools {
+		if t.Info().Name == name {
+			return t
+		}
+	}
+	return nil
+}
+
+// truncate 把过长字符串截短以便安全记录日志。
 func truncate(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
@@ -408,7 +423,7 @@ func truncate(s string, max int) string {
 	return s[:max] + "…"
 }
 
-// nopLog is the fallback used when a nil logger is provided to NewRunUsecase.
+// nopLog 是传给 NewRunUsecase 的 nil logger 时使用的占位实现。
 type nopLog struct{}
 
 func (nopLog) Debug(context.Context, string, ...any) {}

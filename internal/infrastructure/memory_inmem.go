@@ -8,22 +8,22 @@ import (
 	"pi-golang/internal/entity"
 )
 
-// compile-time assertion: *InMemoryMemory satisfies adapter.MemoryStore.
+// 编译期断言：*InMemoryMemory 满足 adapter.MemoryStore。
 var _ adapter.MemoryStore = (*InMemoryMemory)(nil)
 
-// InMemoryMemory is a thread-safe, process-lifetime Memory implementation.
-// Use this for testing and for short-lived REPL runs.
+// InMemoryMemory 是线程安全、进程生命周期的 Memory 实现。
+// 用于测试和短命 REPL 运行。
 type InMemoryMemory struct {
 	mu   sync.RWMutex
 	data map[string]entity.Item
 }
 
-// NewInMemoryMemory returns an empty in-memory store.
+// NewInMemoryMemory 返回一个空的内存存储。
 func NewInMemoryMemory() *InMemoryMemory {
 	return &InMemoryMemory{data: make(map[string]entity.Item)}
 }
 
-// Get returns the matching item or entity.ErrNotFound.
+// Get 返回匹配项或 entity.ErrNotFound。
 func (m *InMemoryMemory) Get(_ context.Context, key string) (entity.Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -34,7 +34,7 @@ func (m *InMemoryMemory) Get(_ context.Context, key string) (entity.Item, error)
 	return v, nil
 }
 
-// Set inserts or overwrites an item.
+// Set 插入或覆盖一条记录。
 func (m *InMemoryMemory) Set(_ context.Context, item entity.Item) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -42,7 +42,7 @@ func (m *InMemoryMemory) Set(_ context.Context, item entity.Item) error {
 	return nil
 }
 
-// Delete removes an item by key. Missing keys are silently ignored.
+// Delete 按 key 删除记录。缺失的 key 静默忽略。
 func (m *InMemoryMemory) Delete(_ context.Context, key string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -50,8 +50,7 @@ func (m *InMemoryMemory) Delete(_ context.Context, key string) error {
 	return nil
 }
 
-// List returns all items whose Kind matches. If kind is unused by any
-// stored item the returned slice is empty (not nil).
+// List 返回所有 Kind 匹配的记录。若无匹配返回空切片（非 nil）。
 func (m *InMemoryMemory) List(_ context.Context, kind entity.Kind) ([]entity.Item, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()

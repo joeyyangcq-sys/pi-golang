@@ -1,9 +1,11 @@
-// Package entity holds the core, framework-agnostic domain objects.
+// Package entity 存放与框架无关的核心领域对象。
+//
+// 本包零第三方依赖（仅 Go 标准库），是 Clean Architecture 最内层。
 package entity
 
 import "errors"
 
-// AgentState enumerates the lifecycle states of an agent during a run.
+// AgentState 枚举 Agent 在一次运行中的生命周期状态。
 type AgentState int
 
 const (
@@ -30,8 +32,7 @@ func (s AgentState) String() string {
 	return "unknown"
 }
 
-// Config is the static, user-visible configuration of an Agent.
-// Zero values are valid and indicate sensible defaults.
+// Config 是 Agent 的静态、用户可见配置。零值即合法的合理默认。
 type Config struct {
 	Name          string
 	SystemPrompt  string
@@ -40,49 +41,63 @@ type Config struct {
 	MaxIterations int
 }
 
-// Option is a functional option passed to agent constructors.
+// Option 是传给 Agent 构造器的功能选项。
 type Option func(*Agent)
 
-// WithConfig fully replaces the Agent config.
+// WithConfig 整体替换 Agent 配置。
 func WithConfig(c Config) Option {
 	return func(a *Agent) { a.cfg = c }
 }
 
-// WithSystemPrompt overrides just the system prompt.
+// WithSystemPrompt 仅覆盖系统提示。
 func WithSystemPrompt(p string) Option {
 	return func(a *Agent) { a.cfg.SystemPrompt = p }
 }
 
-// WithModel overrides just the model id.
+// WithModel 仅覆盖模型 id。
 func WithModel(m string) Option {
 	return func(a *Agent) { a.cfg.Model = m }
 }
 
-// WithLLM wires an LLM backend into the Agent.
+// WithLLM 把 LLM 后端接入 Agent。
 func WithLLM(l LLM) Option {
 	return func(a *Agent) { a.llm = l }
 }
 
-// WithMemory wires a Memory backend into the Agent.
+// WithMemory 把 Memory 后端接入 Agent。
 func WithMemory(m Memory) Option {
 	return func(a *Agent) { a.memory = m }
 }
 
-// WithTools replaces the list of tools the Agent may invoke.
+// WithTools 替换 Agent 可调用的工具列表。
 func WithTools(tools []Tool) Option {
 	return func(a *Agent) { a.tools = tools }
 }
 
-// WithPluginState wires the plugin-namespace state store into the Agent.
+// WithPluginState 把插件命名空间状态存储接入 Agent。
 func WithPluginState(s PluginStateStore) Option {
 	return func(a *Agent) { a.pluginState = s }
 }
 
-// Agent is the central entity representing a single AI agent instance.
+// WithPlugins 设置 Agent 的扩展列表。Usecase 层会在循环的每个环节
+// 对这些插件按需类型断言并触发对应钩子。同时，实现了 WithRegisterTools
+// 的插件其工具会被合并进 Agent 的工具列表（最后写入胜出）。
+func WithPlugins(ps []Plugin) Option {
+	return func(a *Agent) { a.plugins = ps }
+}
+
+// WithEventBus 把事件总线接入 Agent。Usecase 在每个环节都会向它
+// 发布事件，订阅者（遥测/日志/审计）可旁路观察而不影响主流程。
+// 为 nil 时 Usecase 会跳过发布，调用方无需 nil 检查。
+func WithEventBus(b EventBus) Option {
+	return func(a *Agent) { a.eventBus = b }
+}
+
+// Agent 是代表单个 AI Agent 实例的核心实体。
 //
-// An Agent is intentionally small: it only carries its configuration and
-// its pluggable backends (LLM / Memory / Tools / PluginState). Execution
-// state lives in the Usecase layer (see internal/usecase/run.go).
+// Agent 刻意保持精简：只携带配置和可插拔后端（LLM/Memory/Tools/
+// PluginState/Plugins/EventBus）。执行态由 Usecase 层持有
+// （见 internal/usecase/run.go）。
 type Agent struct {
 	cfg         Config
 	state       AgentState
@@ -90,11 +105,11 @@ type Agent struct {
 	memory      Memory
 	tools       []Tool
 	pluginState PluginStateStore
+	plugins     []Plugin
+	eventBus    EventBus
 }
 
-// NewAgent creates a new, idle Agent from the provided options.
-// An error is returned only if required backends are missing *and* the
-// caller has opted-in to validation via options.
+// NewAgent 根据传入选项创建一个 idle 的 Agent。
 func NewAgent(opts ...Option) *Agent {
 	a := &Agent{
 		cfg: Config{
@@ -110,34 +125,43 @@ func NewAgent(opts ...Option) *Agent {
 	return a
 }
 
-// Config returns a copy of the agent's static configuration.
+// Config 返回 Agent 静态配置的副本。
 func (a *Agent) Config() Config { return a.cfg }
 
-// State returns the agent's current lifecycle state.
+// State 返回 Agent 当前生命周期状态。
 func (a *Agent) State() AgentState { return a.state }
 
-// SetState mutates the agent state. Primarily used by the Usecase layer.
+// SetState 修改 Agent 状态，主要由 Usecase 层使用。
 func (a *Agent) SetState(s AgentState) { a.state = s }
 
-// LLM returns the LLM backend, which may be nil.
+// LLM 返回 LLM 后端，可能为 nil。
 func (a *Agent) LLM() LLM { return a.llm }
 
-// Memory returns the Memory backend, which may be nil.
+// Memory 返回 Memory 后端，可能为 nil。
 func (a *Agent) Memory() Memory { return a.memory }
 
-// PluginState returns the plugin-namespace state store, which may be nil
-// (hooks that need state should gracefully degrade when it is nil, or
-// return a descriptive error at their discretion).
+// PluginState 返回插件命名空间状态存储，可能为 nil（需要状态的钩子
+// 应在 nil 时优雅降级或返回描述性错误）。
 func (a *Agent) PluginState() PluginStateStore { return a.pluginState }
 
-// Tools returns a copy of the agent's tool list.
+// Plugins 返回 Agent 的扩展列表副本。
+func (a *Agent) Plugins() []Plugin {
+	out := make([]Plugin, len(a.plugins))
+	copy(out, a.plugins)
+	return out
+}
+
+// EventBus 返回事件总线，可能为 nil（Usecase 会跳过发布）。
+func (a *Agent) EventBus() EventBus { return a.eventBus }
+
+// Tools 返回 Agent 工具列表的副本。
 func (a *Agent) Tools() []Tool {
 	out := make([]Tool, len(a.tools))
 	copy(out, a.tools)
 	return out
 }
 
-// FindTool returns the first tool whose name matches, or nil.
+// FindTool 返回名称匹配的第一个工具，找不到返回 nil。
 func (a *Agent) FindTool(name string) Tool {
 	for _, t := range a.tools {
 		if t.Info().Name == name {
@@ -147,6 +171,5 @@ func (a *Agent) FindTool(name string) Tool {
 	return nil
 }
 
-// ErrLLMNotConfigured is returned by the Usecase layer when the Agent
-// was created without an LLM backend.
-var ErrLLMNotConfigured = errors.New("agent: LLM backend not configured")
+// ErrLLMNotConfigured 在 Agent 未配置 LLM 后端时由 Usecase 层返回。
+var ErrLLMNotConfigured = errors.New("agent: LLM 后端未配置")

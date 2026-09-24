@@ -6,10 +6,9 @@ import (
 	"os"
 )
 
-// Logger matches the Logger port declared in internal/usecase/run.go.
-// Declared again here so the Adapter layer has a stable seam to target
-// without importing the Usecase package (direction of dependencies must
-// never point inward).
+// Logger 与 internal/usecase/run.go 里声明的 Logger 端口一致。
+// 在此再声明一次，让 Adapter 层有一个稳定的接缝目标，而无需导入
+// Usecase 包（依赖方向绝不向内指）。
 type Logger interface {
 	Debug(ctx context.Context, msg string, args ...any)
 	Info(ctx context.Context, msg string, args ...any)
@@ -17,7 +16,7 @@ type Logger interface {
 	Error(ctx context.Context, msg string, args ...any)
 }
 
-// NopLogger is a no-op Logger useful in tests.
+// NopLogger 是测试中可用的 no-op Logger。
 var NopLogger Logger = nop{}
 
 type nop struct{}
@@ -27,8 +26,8 @@ func (nop) Info(context.Context, string, ...any)  {}
 func (nop) Warn(context.Context, string, ...any)  {}
 func (nop) Error(context.Context, string, ...any) {}
 
-// DefaultSlog returns a Logger backed by log/slog writing JSON to stderr
-// at the given level (debug | info | warn | error). Defaults to info.
+// DefaultSlog 返回一个由 log/slog 支撑的 Logger，向 stderr 输出 JSON，
+// 级别由 level 指定（debug | info | warn | error），默认 info。
 func DefaultSlog(level string) Logger {
 	var lvl slog.Level
 	switch level {

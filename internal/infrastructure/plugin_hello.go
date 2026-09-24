@@ -4,147 +4,125 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sync"
 
 	"pi-golang/internal/entity"
 )
 
-// HelloPlugin is a *minimal, educational* built-in plugin that exercises
-// every single hook phase and ships its own tool. It intentionally has no
-// external dependencies so the whole skeleton still builds with just stdlib.
+// HelloPlugin 是一个示例扩展，演示插件系统的四类能力：
+//  1. WithRegisterTools：自带一个 hello 工具注册给 Agent；
+//  2. WithToolAfter：观察工具调用结果（计数）；
+//  3. WithTurnEnd：在会话结束时把计数持久化到 PluginState；
+//  4. 事件订阅：订阅 EventError，演示"旁路捕捉所有环节错误"。
 //
-// Study this file to learn how to write your own extension — the pattern is
-// exactly the one described in pi's docs §5 (Level-1 plugin kinds + Level-2
-// coding-agent extension hooks merged into one interface-assertion model).
-type HelloPlugin struct{}
-
-// ID returns the canonical plugin identifier. Namespace "pi/" is reserved
-// for built-in plugins shipped by the framework itself.
-func (HelloPlugin) ID() entity.PluginID { return "pi/hello" }
-
-// RegisterTools declares the tools this plugin ships. The returned slice is
-// merged into the agent's tool pool by the Usecase layer; duplicate names
-// follow a last-writer-wins rule documented in mergeTools.
-func (HelloPlugin) RegisterTools() []entity.Tool {
-	return []entity.Tool{HelloTool{}}
+// 它同时是"工具/插件报错回传 LLM"链路的活样本：hello 工具内部
+// 反序列化失败会返回 IsError=true 的 Result，Usecase 会把它作为
+// ToolReply 回传给 LLM。
+type HelloPlugin struct {
+	mu    sync.Mutex
+	count int
+	state entity.PluginStateStore
+	bus   entity.EventBus
 }
 
-// OnTurnStart fires once before anything else happens. Here we bump an
-// internal run counter using PluginStateStore (exact same pattern as pi's
-// RewindableState.plugins["pi/hello"]["run_count"]).
-func (HelloPlugin) OnTurnStart(ctx context.Context, a *entity.Agent, info entity.TurnStartInfo) (entity.TurnStartInfo, error) {
-	if store := a.PluginState(); store != nil {
-		st, err := store.GetState(ctx, "pi/hello")
-		if err != nil {
-			return info, fmt.Errorf("get state: %w", err)
-		}
-		prev, _ := st["run_count"].(float64) // JSON numbers round-trip as float64
-		st["run_count"] = prev + 1
-		if err := store.SetState(ctx, "pi/hello", st); err != nil {
-			return info, fmt.Errorf("set state: %w", err)
-		}
-		info.UserPrompt = info.UserPrompt +
-			fmt.Sprintf(" (runs so far: %d)", int(prev+1))
+// 编译期断言：*HelloPlugin 满足多个可选钩子接口。
+var (
+	_ entity.Plugin            = (*HelloPlugin)(nil)
+	_ entity.WithRegisterTools = (*HelloPlugin)(nil)
+	_ entity.WithToolAfter     = (*HelloPlugin)(nil)
+	_ entity.WithTurnEnd       = (*HelloPlugin)(nil)
+	_ entity.WithToolBefore    = (*HelloPlugin)(nil)
+)
+
+// NewHelloPlugin 构造一个示例插件。state/bus 可为 nil（插件会优雅降级）。
+// 若 bus 非 nil，会订阅 EventError 以演示事件监听。
+func NewHelloPlugin(state entity.PluginStateStore, bus entity.EventBus) *HelloPlugin {
+	p := &HelloPlugin{state: state, bus: bus}
+	if bus != nil {
+		bus.Subscribe(entity.EventError, p.onEventError)
 	}
-	return info, nil
+	return p
 }
 
-// OnTurnEnd fires on every terminal path (success, error, cancel). Here we
-// log the final state of the run counter — this is the canonical hook for
-// flushing telemetry or writing a summary footer.
-func (HelloPlugin) OnTurnEnd(ctx context.Context, a *entity.Agent, info entity.TurnEndInfo) (entity.TurnEndInfo, error) {
-	if store := a.PluginState(); store != nil {
-		st, _ := store.GetState(ctx, "pi/hello")
-		if n, ok := st["run_count"].(float64); ok {
-			info.FinalAnswer = info.FinalAnswer +
-				fmt.Sprintf("\n\n<!-- pi/hello plugin: run_count=%d, iterations=%d -->",
-					int(n), info.Iterations)
-		}
-	}
-	return info, nil
+// ID 返回插件唯一标识（内置用 "pi/" 前缀）。
+func (p *HelloPlugin) ID() entity.PluginID { return "pi/hello" }
+
+// RegisterTools 返回该插件自带的工具列表。
+func (p *HelloPlugin) RegisterTools() []entity.Tool {
+	return []entity.Tool{helloTool{}}
 }
 
-// OnLLMBefore fires before each Chat call. Here we inject a small steering
-// line into the system prompt if one exists, otherwise append it to the
-// last user message — demonstrating how pi extensions steer prompts.
-func (HelloPlugin) OnLLMBefore(_ context.Context, _ *entity.Agent, req entity.ChatRequest) (entity.ChatRequest, error) {
-	steering := "Be concise. If the user says hi, respond warmly."
-	msgs := make(entity.Conversation, 0, len(req.Messages)+1)
-	inserted := false
-	for i, m := range msgs {
-		_ = i
-		if m.Role == entity.RoleSystem {
-			m.Content = m.Content + "\n" + steering
-			msgs = append(msgs, m)
-			inserted = true
-			continue
-		}
-		_ = m
-	}
-	_ = inserted
-	_ = steering
-	// Keep the implementation simple in the skeleton: pass through unchanged.
-	// The block above is a hint of how a real steering plugin would work.
-	_ = msgs
-	return req, nil
-}
-
-// OnLLMAfter fires after each successful Chat call. This is the canonical
-// place to log token usage or scrub PII from responses.
-func (HelloPlugin) OnLLMAfter(_ context.Context, _ *entity.Agent, _ entity.ChatRequest, resp entity.ChatResponse) (entity.ChatResponse, error) {
-	// Skeleton: pass through. In a real plugin you'd add resp.Usage.Input > 0
-	// checks here and push to telemetry.
-	return resp, nil
-}
-
-// OnToolBefore fires right before a tool runs. Typical uses: allow-list
-// gating, rate limiting, parameter scrubbing, or forcing dry-run.
-func (HelloPlugin) OnToolBefore(_ context.Context, _ *entity.Agent, t entity.Tool, r entity.Request) (entity.Request, error) {
-	// Skeleton: only log the fact that we're about to call t.Info().Name.
-	// A real gating plugin would return an error for disallowed names.
-	_ = t
+// OnToolBefore 演示工具调用前钩子：这里仅放行，但可在此做白名单/限流。
+func (p *HelloPlugin) OnToolBefore(_ context.Context, _ *entity.Agent, _ entity.Tool, r entity.Request) (entity.Request, error) {
 	return r, nil
 }
 
-// OnToolAfter fires right after a tool returns. Typical uses: result
-// caching, truncating huge tool output, or translating errors into friendlier messages.
-func (HelloPlugin) OnToolAfter(_ context.Context, _ *entity.Agent, t entity.Tool, r entity.Request, res entity.Result) (entity.Result, error) {
-	_ = t
-	_ = r
-	// Skeleton: pass-through. If we wanted caching we'd hash r.Arguments and
-	// store res.Content into PluginStateStore keyed by (tool, args hash).
+// OnToolAfter 演示工具调用后钩子：统计成功调用次数。
+func (p *HelloPlugin) OnToolAfter(_ context.Context, _ *entity.Agent, _ entity.Tool, _ entity.Request, res entity.Result) (entity.Result, error) {
+	if !res.IsError {
+		p.mu.Lock()
+		p.count++
+		p.mu.Unlock()
+	}
 	return res, nil
 }
 
-// -------------------- HelloTool — shipped alongside HelloPlugin --------------------
+// OnTurnEnd 在会话结束时把计数写入 PluginState（演示跨环节状态持久化）。
+func (p *HelloPlugin) OnTurnEnd(ctx context.Context, _ *entity.Agent, info entity.TurnEndInfo) (entity.TurnEndInfo, error) {
+	if p.state == nil {
+		return info, nil
+	}
+	p.mu.Lock()
+	c := p.count
+	p.mu.Unlock()
+	_ = p.state.SetState(ctx, p.ID(), map[string]any{"greeting_count": c})
+	return info, nil
+}
 
-// HelloTool is the example tool registered by HelloPlugin. It's a simple
-// "greets the user by name" callable so you can end-to-end verify the
-// "RegisterTools → merged into agent tools → ToolBefore → Tool.Call →
-// ToolAfter → ToolReply" pipeline by configuring a real LLM.
-type HelloTool struct{}
+// onEventError 是 EventError 的订阅回调：演示"旁路捕捉所有环节错误"。
+// 注意：事件回调不能修改主流程，仅用于观察/记录。
+func (p *HelloPlugin) onEventError(_ context.Context, e entity.Event) error {
+	// 实际项目可在此把错误推到监控/告警通道。
+	_ = fmt.Sprintf("[pi/hello] 捕捉到环节错误: %s: %v", e.Payload, e.Err)
+	return nil
+}
 
-// Info declares the schema shown to the LLM so it knows how to call us.
-func (HelloTool) Info() entity.Info {
+// Count 返回当前累计的成功工具调用次数（线程安全）。
+func (p *HelloPlugin) Count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.count
+}
+
+// --- hello 工具实现 ---
+
+// helloTool 是 HelloPlugin 注册的具体工具。
+type helloTool struct{}
+
+func (helloTool) Info() entity.Info {
 	return entity.Info{
 		Name:        "hello",
-		Description: "Greets the caller by name. Use this whenever the user wants a personalized hello or greeting.",
-		InputSchema: json.RawMessage(
-			`{"type":"object","properties":{"name":{"type":"string","description":"The name of the person to greet"}},"required":["name"]}`,
-		),
+		Description: "按名字打招呼。当用户想要友好问候时使用。",
+		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
 	}
 }
 
-type helloArgs struct{ Name string }
+type helloArgs struct {
+	Name string `json:"name"`
+}
 
-// Call implements the actual tool logic. DecodeArguments is a thin wrapper
-// over json.Unmarshal defined in entity/tool.go.
-func (HelloTool) Call(_ context.Context, r entity.Request) entity.Result {
+// Call 执行工具。参数反序列化失败会返回 IsError=true 的 Result，
+// Usecase 会把该错误作为 ToolReply 回传给 LLM（错误回传链路）。
+func (helloTool) Call(ctx context.Context, r entity.Request) entity.Result {
 	var args helloArgs
 	if err := entity.DecodeArguments(r, &args); err != nil {
-		return entity.Result{Content: err.Error(), IsError: true}
+		return entity.Result{Content: fmt.Sprintf("参数解析失败: %v", err), IsError: true}
 	}
-	if args.Name == "" {
-		return entity.Result{Content: "hello: missing name", IsError: true}
+	msg := "Hello, " + args.Name + "!"
+	select {
+	case <-ctx.Done():
+		return entity.Result{Content: ctx.Err().Error(), IsError: true}
+	default:
 	}
-	return entity.Result{Content: fmt.Sprintf("Hello, %s! ✨", args.Name)}
+	return entity.Result{Content: msg}
 }
