@@ -29,8 +29,9 @@ pi-golang/
     ├── usecase/                     # 🟠 Layer 2: 应用层
     │   ├── run.go                   #   RunUsecase（钩子编排 + 事件发布 + 错误回传）
     │   └── run_test.go              #   单元测试
+    ├── prompt/                      #   最小 PromptArtifact（内置提示词 + SHA-256）
     ├── adapter/                     # 🟢 Layer 3: 接口适配层
-    │   ├── llm.go                   #   LLMProvider + OpenAI/Anthropic 占位
+    │   ├── llm.go                   #   OpenAI 兼容文本 Chat Completions
     │   ├── memory.go                #   MemoryStore 镜像
     │   └── logger.go                #   Logger 镜像 + slog JSON
     └── infrastructure/             # 🔵 Layer 4: 最外层实现
@@ -57,9 +58,35 @@ gofmt -l .
 golangci-lint run ./...
 go test ./...
 
-# 运行（未配 API Key 会报 ErrNotImplemented，骨架占位符，正常）
-go run . run -prompt "hello"
+# 运行最小文本 Agent 循环。模型名称由你所用账户/网关决定，显式设置
+# 能避免因为 provider 默认值变化造成不可复现的结果。
+export LLM_PROVIDER=openai
+export LLM_API_KEY='你的 API key'
+export LLM_MODEL='你的模型 ID'
+go run . run -prompt "请用一句话解释 Go interface" --debug
 ```
+
+当前接通的是 OpenAI Chat Completions 兼容的纯文本循环（OpenAI 与
+OpenRouter）。Anthropic 和远端工具调用协议仍是后续迭代；本地
+`RunUsecase` 的工具、Hook、事件单元测试不受影响。
+
+## 调试最小循环
+
+`--debug` 会把本次实际使用的 PromptArtifact（id、version、SHA-256）和
+系统提示词打印到 `stderr`，最终回答仍只写入 `stdout`，所以可以安全地
+用管道收集答案。系统提示词可能含业务信息，不要在生产日志中长期打开。
+
+```bash
+# 查看每轮 LLM 调用数、工具调用数等 JSON 结构化日志
+LOG_LEVEL=debug go run . run -prompt "hello" --debug
+
+# 使用环境变量覆盖内置 prompts/base.md；输出会标记为 agent.override
+AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run -prompt "你好" --debug
+```
+
+排错顺序：先确认 `--debug` 的 model 和 prompt 元数据符合预期；再看
+`LOG_LEVEL=debug` 的 `llm 回复` 记录；最后检查返回的 HTTP 状态。缺少
+`LLM_API_KEY` 或 `LLM_MODEL` 时会得到明确的本地错误，不会发出网络请求。
 
 ## 插件/事件机制速览
 
@@ -83,7 +110,7 @@ go run . run -prompt "hello"
 
 ## 下一步
 
-- 接真实 LLM Provider（HTTP 调用 + DTO↔Entity 转换）
+- 加 Anthropic 与远端工具调用协议（assistant tool_calls / tool_call_id）
 - 加流式输出（RunUsecase 加 Event 通道）
 - 加 Planner 策略
 - 接持久化 Memory（Redis / SQLite）

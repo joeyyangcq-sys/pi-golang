@@ -326,7 +326,9 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		}
 
 		a.SetState(entity.AgentActing)
-		conv = conv.Append(entity.Assistant(resp.Content))
+		// 保留 ToolCalls（尤其是 ID）：OpenAI 兼容 provider 下一轮必须把
+		// 这条 assistant 消息与对应 tool reply 一起发送回服务端。
+		conv = conv.Append(entity.AssistantWithToolCalls(resp.Content, resp.ToolCalls))
 
 		// ============================================================
 		// 工具阶段 — 遍历每个 ToolCall
@@ -427,7 +429,7 @@ func (uc *RunUsecase) dispatchTool(
 			uc.Logger.Warn(ctx, "tool.lookup 钩子拒绝工具",
 				"tool", tc.Name, "plugin", p.ID(), "err", herr)
 			replyInfo := entity.ToolReplyInfo{ToolName: tc.Name, Content: msg, IsError: true}
-			conv = conv.Append(entity.ToolReply(tc.Name, msg))
+			conv = conv.Append(entity.ToolReplyForCall(tc.ID, tc.Name, msg))
 			uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
 			return conv
 		}
@@ -465,7 +467,7 @@ func (uc *RunUsecase) dispatchTool(
 		}
 		uc.Logger.Warn(ctx, "工具查找失败", "tool", toolName)
 		replyInfo := entity.ToolReplyInfo{ToolName: toolName, Content: notFoundInfo.Reply, IsError: true}
-		conv = conv.Append(entity.ToolReply(toolName, notFoundInfo.Reply))
+		conv = conv.Append(entity.ToolReplyForCall(tc.ID, toolName, notFoundInfo.Reply))
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
 		return conv
 	}
@@ -493,7 +495,7 @@ func (uc *RunUsecase) dispatchTool(
 			uc.Logger.Warn(ctx, "tool.before 钩子拒绝工具",
 				"tool", toolName, "plugin", p.ID(), "err", herr)
 			replyInfo := entity.ToolReplyInfo{ToolName: toolName, Content: msg, IsError: true}
-			conv = conv.Append(entity.ToolReply(toolName, msg))
+			conv = conv.Append(entity.ToolReplyForCall(tc.ID, toolName, msg))
 			uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
 			blocked = true
 			break
@@ -545,7 +547,7 @@ func (uc *RunUsecase) dispatchTool(
 		Content:  result.Content,
 		IsError:  result.IsError,
 	}
-	conv = conv.Append(entity.ToolReply(toolName, result.Content))
+	conv = conv.Append(entity.ToolReplyForCall(tc.ID, toolName, result.Content))
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolReplyAppended, Payload: replyInfo})
 	for _, p := range plugins {
 		h, ok := p.(entity.WithToolReplyAppended)

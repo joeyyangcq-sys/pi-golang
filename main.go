@@ -45,7 +45,9 @@ func main() {
 func cmdRun(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var prompt string
+	var debug bool
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
+	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -59,6 +61,16 @@ func cmdRun(ctx context.Context, args []string) int {
 		return 1
 	}
 	agent := g.NewAgent(ctx)
+	if debug {
+		// Debug 输出写 stderr，避免与最终 answer 的 stdout 混在一起，便于
+		// 脚本只采集回答。提示词可能含业务上下文，生产环境请谨慎开启。
+		fmt.Fprintf(os.Stderr, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
+			g.Prompt.ID, g.Prompt.Version, g.Prompt.Hash, len(g.Prompt.Content))
+		fmt.Fprintf(os.Stderr, "debug: model=%q provider=%q max_iterations=%d tools=%d\n",
+			agent.Config().Model, g.Config.LLM.Provider, agent.Config().MaxIterations, len(agent.Tools()))
+		fmt.Fprintln(os.Stderr, "debug: system prompt follows")
+		fmt.Fprintln(os.Stderr, g.Prompt.Content)
+	}
 	g.Logger.Info(ctx, "已构建 agent", "name", agent.Config().Name,
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
 		"plugins", len(agent.Plugins()), "tools", len(agent.Tools()))
@@ -81,7 +93,7 @@ const helpText = `
 pi-agent — 精简 Clean Architecture Go AI Agent 骨架
 
 Usage:
-  pi-agent run [-prompt "hello"]   运行一次 agent 会话（默认命令）
+  pi-agent run [-prompt "hello"] [-debug]  运行一次 agent 会话（默认命令）
   pi-agent version                 打印版本并退出
   pi-agent help                    显示本帮助
 
@@ -95,4 +107,8 @@ Usage:
   AGENT_TEMPERATURE    0..2 采样温度                        (默认: 0.7)
   AGENT_MAX_ITERATIONS 每次运行最大工具调用循环数           (默认: 5)
   LOG_LEVEL            debug | info | warn | error        (默认: info)
+
+调试:
+  run --debug 会向 stderr 输出实际使用的 PromptArtifact 元数据和系统提示词。
+  设置 LOG_LEVEL=debug 可查看每轮 Agent/LLM 循环的结构化日志。
 `

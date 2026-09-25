@@ -6,13 +6,17 @@ import (
 
 	"pi-golang/internal/adapter"
 	"pi-golang/internal/entity"
+	"pi-golang/internal/prompt"
 	"pi-golang/internal/usecase"
 )
 
 // Graph 持有全部已接线的应用组件。把它当不透明体对待：用 Build 构造，
 // 不要在文件外修改其字段。
 type Graph struct {
-	Config      Config
+	Config Config
+	// Prompt 是本次 Graph 构建时固定下来的提示词快照。后续的 Prompt
+	// Bundle 发布不会回写此值，因而已开始的运行可保持可追踪、可复现。
+	Prompt      prompt.Artifact
 	Logger      adapter.Logger
 	LLM         adapter.LLMProvider
 	Memory      entity.Memory
@@ -29,7 +33,10 @@ func Build() (*Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("di: 加载配置: %w", err)
 	}
-	g := &Graph{Config: cfg}
+	g := &Graph{
+		Config: cfg,
+		Prompt: prompt.Resolve(cfg.Agent.SystemPrompt),
+	}
 
 	g.Logger = NewLogger(cfg.Log.Level)
 	g.LLM = buildLLM(cfg)
@@ -69,7 +76,7 @@ func (g *Graph) NewAgent(_ context.Context, opts ...entity.Option) *entity.Agent
 	base := []entity.Option{
 		entity.WithConfig(entity.Config{
 			Name:          g.Config.Agent.Name,
-			SystemPrompt:  g.Config.Agent.SystemPrompt,
+			SystemPrompt:  g.Prompt.Content,
 			Model:         g.Config.LLM.Model,
 			Temperature:   g.Config.Agent.Temperature,
 			MaxIterations: g.Config.Agent.MaxIterations,
@@ -106,16 +113,24 @@ func mergeTools(groups ...[]entity.Tool) []entity.Tool {
 	return out
 }
 
-// buildLLM 把 Config.LLM 映射到正确的 adapter.LLMProvider 骨架。
-// 所有 provider 目前 Chat() 返回 ErrNotImplemented；接真实 HTTP 端点
-// 留作后续。
+// buildLLM 把 Config.LLM 映射到正确的 adapter.LLMProvider。
+// 当前只接通 OpenAI Chat Completions 兼容协议（OpenAI/OpenRouter）；
+// Anthropic 保持占位，避免在未实现其消息和工具协议时产生误导。
 func buildLLM(cfg Config) adapter.LLMProvider {
 	switch cfg.LLM.Provider {
 	case "anthropic":
 		return adapter.NewAnthropic(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
-	case "openai", "openrouter", "":
-		fallthrough
+	case "openrouter":
+		baseURL := cfg.LLM.BaseURL
+		if baseURL == "" {
+			baseURL = "https://openrouter.ai/api/v1"
+		}
+		return adapter.NewOpenAI(cfg.LLM.APIKey, baseURL, cfg.LLM.Model)
+	case "openai", "":
+		return adapter.NewOpenAI(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
 	default:
+		// 未知 provider 沿用 OpenAI 兼容协议，便于接入私有网关；实际
+		// 端点由 LLM_BASE_URL 明确指定。
 		return adapter.NewOpenAI(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
 	}
 }
