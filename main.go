@@ -278,15 +278,27 @@ func promptSecretLine(reader *bufio.Reader, output io.Writer, label string, hasE
 
 func isInteractive(file *os.File) bool {
 	info, err := file.Stat()
-	return err == nil && info.Mode()&os.ModeCharDevice != 0
+	if err != nil || info.Mode()&os.ModeCharDevice == 0 {
+		return false
+	}
+	// /dev/null 也是字符设备，但不是可交互终端。直接调用 tty（不经过
+	// shell）验证文件描述符，避免把管道或重定向误判成 setup 终端。
+	cmd := exec.Command("tty")
+	cmd.Stdin = file
+	cmd.Stdout = io.Discard
+	cmd.Stderr = io.Discard
+	return cmd.Run() == nil
 }
 
 func providerNeedsAPIKey(provider string) bool {
 	switch strings.ToLower(strings.TrimSpace(provider)) {
 	case "ollama", "lmstudio", "vllm", "custom":
 		return false
-	default:
+	case "openai", "anthropic", "gemini", "google", "openrouter", "groq",
+		"mistral", "xai", "deepseek", "cerebras", "zai", "kimi", "minimax":
 		return true
+	default:
+		return false
 	}
 }
 
@@ -341,7 +353,7 @@ Usage:
 调试:
   run --debug 会向 stderr 输出实际使用的 PromptArtifact 元数据和系统提示词。
   设置 LOG_LEVEL=debug 可查看每轮 Agent/LLM 循环的结构化日志。
-	  首次运行或配置不完整时会进入交互式设置；也可单独运行 pi-agent setup。
+  首次运行或配置不完整时会进入交互式设置；也可单独运行 pi-agent setup。
   API key 不会回显，配置文件使用 0600 权限保存。非交互终端请使用环境变量
   或显式 flags，程序不会阻塞等待输入。
 

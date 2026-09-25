@@ -52,7 +52,8 @@ func Load() (Config, error) {
 	if err != nil {
 		return Config{}, err
 	}
-	provider := strings.ToLower(strings.TrimSpace(saved.Provider))
+	savedProvider := strings.ToLower(strings.TrimSpace(saved.Provider))
+	provider := savedProvider
 	if provider == "" {
 		provider = "openai"
 	}
@@ -60,7 +61,12 @@ func Load() (Config, error) {
 		provider = strings.ToLower(strings.TrimSpace(value))
 	}
 	apiKey := saved.APIKey
-	if value, ok := os.LookupEnv("LLM_API_KEY"); ok {
+	if provider != savedProvider {
+		// 明确切换 provider 时不能复用旧 provider 的凭据，避免把错误的
+		// Authorization header 发给另一家服务；后续再由专属 env 或向导提供。
+		apiKey = ""
+	}
+	if value, ok := os.LookupEnv("LLM_API_KEY"); ok && strings.TrimSpace(value) != "" {
 		apiKey = strings.TrimSpace(value)
 	} else if providerKey := providerAPIKey(provider); providerKey != "" {
 		// 环境变量中的 provider 专属 key 优先于持久化 key，方便临时切换
@@ -112,8 +118,13 @@ func (c Config) NeedsLLMSetup() bool {
 		return false
 	case "custom":
 		return strings.TrimSpace(c.LLM.BaseURL) == ""
-	default:
+	case "openai", "anthropic", "gemini", "google", "openrouter", "groq",
+		"mistral", "xai", "deepseek", "cerebras", "zai", "kimi", "minimax":
 		return strings.TrimSpace(c.LLM.APIKey) == ""
+	default:
+		// 未知 provider 会按 OpenAI-compatible custom 网关接线，URL 是
+		// 必需项，API key 是否需要由网关自行决定。
+		return strings.TrimSpace(c.LLM.BaseURL) == ""
 	}
 }
 
