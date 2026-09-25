@@ -21,6 +21,17 @@ type fakeLLM struct {
 	err       error // 非 nil 时第一次调用返回该错误
 }
 
+type recordingAuditSink struct {
+	records []LLMAuditRecord
+}
+
+func (s *recordingAuditSink) WriteLLM(_ context.Context, record LLMAuditRecord) error {
+	s.records = append(s.records, record)
+	return nil
+}
+
+func (*recordingAuditSink) Close() error { return nil }
+
 func (f *fakeLLM) Chat(_ context.Context, req entity.ChatRequest) (entity.ChatResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -45,6 +56,26 @@ func (f *fakeLLM) callsSnapshot() []entity.ChatRequest {
 	out := make([]entity.ChatRequest, len(f.calls))
 	copy(out, f.calls)
 	return out
+}
+
+func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
+	llm := &fakeLLM{responses: []entity.ChatResponse{{Content: "最终回答"}}}
+	audit := &recordingAuditSink{}
+	uc := NewRunUsecase(nil, audit)
+
+	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), RunInput{UserPrompt: "用户输入"}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if len(audit.records) != 2 {
+		t.Fatalf("审计事件数 = %d, want 2", len(audit.records))
+	}
+	request, response := audit.records[0], audit.records[1]
+	if request.Phase != "request" || response.Phase != "response" || request.RunID == "" || request.RunID != response.RunID {
+		t.Fatalf("审计阶段或 run ID 错误: %+v", audit.records)
+	}
+	if request.Iteration != 1 || request.Request.Messages.Last().Content != "用户输入" || response.Response.Content != "最终回答" {
+		t.Fatalf("审计输入输出错误: %+v", audit.records)
+	}
 }
 
 // errTool 总是返回错误结果。

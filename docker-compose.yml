@@ -1,0 +1,49 @@
+services:
+  # 确定性 mock：Compose demo 不访问真实 LLM，也不需要 API key。
+  mock-llm:
+    image: python:3.12-alpine
+    working_dir: /app
+    volumes:
+      - ./tests/integration/mock_openai.py:/app/mock_openai.py:ro
+    command: ["python", "/app/mock_openai.py", "--host", "0.0.0.0", "--port", "8080"]
+
+  # 当前 PostgreSQL 容器供后续 LLMAuditSink 的 PG 实现使用；Agent 目前
+  # 使用 JSONL 文件审计，因此不会主动连接该服务。
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pi
+      POSTGRES_PASSWORD: pi-local-only
+      POSTGRES_DB: pi_agent
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pi -d pi_agent"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # 一次性运行的本地部署 demo。运行结束后可检查 ./var/audit/llm.jsonl。
+  pi-agent:
+    build:
+      context: .
+    depends_on:
+      mock-llm:
+        condition: service_started
+      postgres:
+        condition: service_healthy
+    environment:
+      LLM_PROVIDER: custom
+      LLM_BASE_URL: http://mock-llm:8080/v1
+      LLM_MODEL: compose-mock
+      AUDIT_LOG_FILE: /var/lib/pi-agent/audit/llm.jsonl
+      AUDIT_CONTENT_MODE: full
+      LOG_LEVEL: debug
+    volumes:
+      - ./var/audit:/var/lib/pi-agent/audit
+    command: ["run", "--prompt", "hello from docker compose"]
+
+volumes:
+  postgres-data:

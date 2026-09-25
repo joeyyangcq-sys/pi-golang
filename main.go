@@ -53,12 +53,16 @@ func cmdRun(ctx context.Context, args []string) int {
 	var apiKey string
 	var baseURL string
 	var model string
+	var auditFile string
+	var auditContent string
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
 	fs.StringVar(&apiKey, "api-key", "", "本次使用的 API key，覆盖环境变量")
 	fs.StringVar(&baseURL, "base-url", "", "本次 API base URL，覆盖 LLM_BASE_URL")
 	fs.StringVar(&model, "model", "", "本次使用的模型，覆盖 LLM_MODEL")
+	fs.StringVar(&auditFile, "audit-file", "", "JSONL 审计文件路径，记录每轮 LLM 输入输出")
+	fs.StringVar(&auditContent, "audit-content", "", "审计内容模式：redacted（默认）或 full")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -72,11 +76,17 @@ func cmdRun(ctx context.Context, args []string) int {
 		return 1
 	}
 	cfg = cfg.WithLLMOverrides(provider, apiKey, baseURL, model)
+	cfg = cfg.WithAuditOverrides(auditFile, auditContent)
 	g, err := infrastructure.BuildWithConfig(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "启动:", err)
 		return 1
 	}
+	defer func() {
+		if closeErr := g.Close(); closeErr != nil {
+			fmt.Fprintln(os.Stderr, "关闭审计日志:", closeErr)
+		}
+	}()
 	agent := g.NewAgent(ctx)
 	if debug {
 		// Debug 输出写 stderr，避免与最终 answer 的 stdout 混在一起，便于
@@ -125,6 +135,8 @@ Usage:
   AGENT_TEMPERATURE    0..2 采样温度                        (默认: 0.7)
   AGENT_MAX_ITERATIONS 每次运行最大工具调用循环数           (默认: 5)
   LOG_LEVEL            debug | info | warn | error        (默认: info)
+  AUDIT_LOG_FILE        JSONL 审计文件路径；为空时不启用
+  AUDIT_CONTENT_MODE    redacted | full（默认: redacted）
 
 调试:
   run --debug 会向 stderr 输出实际使用的 PromptArtifact 元数据和系统提示词。
@@ -132,5 +144,6 @@ Usage:
 
 run flags:
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
+  --audit-file, --audit-content               仅覆盖本次运行的审计配置。
   API key 优先级：--api-key > LLM_API_KEY > provider 专属环境变量。
 `

@@ -30,21 +30,33 @@ type LogConfig struct {
 	Level string // debug | info | warn | error
 }
 
+// AuditConfig 控制可选的 LLM 输入输出审计。FilePath 为空时不启用审计；
+// 选择 full 会把 prompt、用户输入和模型输出持久化，须由部署者保护文件。
+type AuditConfig struct {
+	FilePath    string
+	ContentMode string // redacted | full
+}
+
 // Config 聚合从环境变量加载的全部应用设置。
 type Config struct {
 	LLM   LLMConfig
 	Agent AgentConfig
 	Log   LogConfig
+	Audit AuditConfig
 }
 
 // Load 从环境变量读取配置并应用默认值。缺失值会被合理默认值替换；
 // 只有真正的配置错误（如负温度）才报错。
 func Load() (Config, error) {
 	provider := strings.ToLower(env("LLM_PROVIDER", "openai"))
+	apiKey := env("LLM_API_KEY", "")
+	if apiKey == "" {
+		apiKey = providerAPIKey(provider)
+	}
 	cfg := Config{
 		LLM: LLMConfig{
 			Provider: provider,
-			APIKey:   env("LLM_API_KEY", providerAPIKey(provider)),
+			APIKey:   apiKey,
 			BaseURL:  env("LLM_BASE_URL", ""),
 			Model:    env("LLM_MODEL", ""),
 		},
@@ -57,15 +69,36 @@ func Load() (Config, error) {
 		Log: LogConfig{
 			Level: env("LOG_LEVEL", "info"),
 		},
+		Audit: AuditConfig{
+			FilePath:    env("AUDIT_LOG_FILE", ""),
+			ContentMode: env("AUDIT_CONTENT_MODE", string(AuditContentRedacted)),
+		},
 	}
 	return cfg, cfg.Validate()
+}
+
+// WithAuditOverrides 返回应用命令行覆盖后的审计配置副本。
+func (c Config) WithAuditOverrides(filePath, contentMode string) Config {
+	if strings.TrimSpace(filePath) != "" {
+		c.Audit.FilePath = strings.TrimSpace(filePath)
+	}
+	if strings.TrimSpace(contentMode) != "" {
+		c.Audit.ContentMode = strings.ToLower(strings.TrimSpace(contentMode))
+	}
+	return c
 }
 
 // WithLLMOverrides 返回应用命令行覆盖后的配置副本。环境变量负责提供
 // 持久默认值，而 CLI 参数仅影响当前进程，不会写回用户环境或配置文件。
 func (c Config) WithLLMOverrides(provider, apiKey, baseURL, model string) Config {
-	if strings.TrimSpace(provider) != "" {
-		c.LLM.Provider = strings.ToLower(strings.TrimSpace(provider))
+	provider = strings.TrimSpace(provider)
+	if provider != "" {
+		c.LLM.Provider = strings.ToLower(provider)
+		// --provider 不应意外继续使用默认 provider 的专属 key。只有
+		// 用户明确设置了通用 LLM_API_KEY 时才保留它。
+		if strings.TrimSpace(env("LLM_API_KEY", "")) == "" && strings.TrimSpace(apiKey) == "" {
+			c.LLM.APIKey = providerAPIKey(c.LLM.Provider)
+		}
 	}
 	if strings.TrimSpace(apiKey) != "" {
 		c.LLM.APIKey = strings.TrimSpace(apiKey)
@@ -86,6 +119,9 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.MaxIterations < 1 {
 		return errors.New("config: AGENT_MAX_ITERATIONS 必须 >= 1")
+	}
+	if c.Audit.ContentMode != string(AuditContentRedacted) && c.Audit.ContentMode != string(AuditContentFull) {
+		return errors.New("config: AUDIT_CONTENT_MODE 必须是 redacted 或 full")
 	}
 	return nil
 }

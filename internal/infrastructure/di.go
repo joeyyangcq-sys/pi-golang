@@ -23,6 +23,7 @@ type Graph struct {
 	EventBus    entity.EventBus
 	PluginState entity.PluginStateStore
 	Plugins     []entity.Plugin
+	Audit       usecase.LLMAuditSink
 	RunUsecase  *usecase.RunUsecase
 }
 
@@ -53,8 +54,32 @@ func BuildWithConfig(cfg Config) (*Graph, error) {
 	g.EventBus = NewInMemoryEventBus()
 	g.PluginState = NewInMemoryPluginState()
 	g.Plugins = buildPlugins(g.PluginState, g.EventBus)
-	g.RunUsecase = usecase.NewRunUsecase(g.Logger)
+	audit, err := buildAudit(cfg)
+	if err != nil {
+		return nil, err
+	}
+	g.Audit = audit
+	g.RunUsecase = usecase.NewRunUsecase(g.Logger, g.Audit)
 	return g, nil
+}
+
+// Close 关闭可选审计资源。main 在退出时调用它，避免最后一条记录丢失。
+func (g *Graph) Close() error {
+	if g.Audit == nil {
+		return nil
+	}
+	return g.Audit.Close()
+}
+
+func buildAudit(cfg Config) (usecase.LLMAuditSink, error) {
+	if cfg.Audit.FilePath == "" {
+		return nil, nil
+	}
+	sink, err := NewFileAuditSink(cfg.Audit.FilePath, AuditContentMode(cfg.Audit.ContentMode))
+	if err != nil {
+		return nil, fmt.Errorf("di: 初始化 LLM 文件审计: %w", err)
+	}
+	return sink, nil
 }
 
 // buildPlugins 构造内置插件列表。新增内置插件时在此追加。

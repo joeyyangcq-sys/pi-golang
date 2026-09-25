@@ -50,15 +50,20 @@ type RunOutput struct {
 // RunUsecase 封装"运行 Agent 一次"用例的依赖。
 type RunUsecase struct {
 	Logger Logger
+	Audit  LLMAuditSink
 }
 
 // NewRunUsecase 用给定 logger 构造 RunUsecase。log 为 nil 时使用 no-op
 // logger，调用方无需 nil 检查。
-func NewRunUsecase(log Logger) *RunUsecase {
+func NewRunUsecase(log Logger, audit ...LLMAuditSink) *RunUsecase {
 	if log == nil {
 		log = nopLog{}
 	}
-	return &RunUsecase{Logger: log}
+	var sink LLMAuditSink
+	if len(audit) > 0 {
+		sink = audit[0]
+	}
+	return &RunUsecase{Logger: log, Audit: sink}
 }
 
 // Execute 驱动完整 Agent 循环，在 16 个时间点全部触发钩子 + 发布事件。
@@ -74,6 +79,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 
 	plugins := a.Plugins()
 	bus := a.EventBus()
+	runID := newRunID()
 
 	// ================================================================
 	// ① RunStart — Execute 刚进入，LLM 配置校验之前
@@ -264,8 +270,25 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		// ============================================================
 		// LLM.Chat 调用
 		// ============================================================
+		uc.writeAudit(ctx, LLMAuditRecord{
+			RunID:      runID,
+			Iteration:  i + 1,
+			Phase:      "request",
+			OccurredAt: time.Now().UTC(),
+			Model:      req.Model,
+			Request:    req,
+		})
 		resp, lerr := a.LLM().Chat(ctx, req)
 		if lerr != nil {
+			uc.writeAudit(ctx, LLMAuditRecord{
+				RunID:      runID,
+				Iteration:  i + 1,
+				Phase:      "error",
+				OccurredAt: time.Now().UTC(),
+				Model:      req.Model,
+				Request:    req,
+				Error:      lerr.Error(),
+			})
 			a.SetState(entity.AgentError)
 			uc.publishError(bus, ctx, "llm.chat", lerr)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: lerr})
@@ -273,6 +296,17 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		}
 		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
 			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content))
+		// 此处记录的是 provider 的原始输出；LLMAfter Hook 可能继续改写
+		// resp，但不能覆盖模型真正返回的审计证据。
+		uc.writeAudit(ctx, LLMAuditRecord{
+			RunID:      runID,
+			Iteration:  i + 1,
+			Phase:      "response",
+			OccurredAt: time.Now().UTC(),
+			Model:      req.Model,
+			Request:    req,
+			Response:   resp,
+		})
 
 		// ============================================================
 		// ⑧ LLMAfter — LLM.Chat 成功返回后
@@ -646,6 +680,17 @@ func (uc *RunUsecase) publish(bus entity.EventBus, ctx context.Context, e entity
 func (uc *RunUsecase) publishError(bus entity.EventBus, ctx context.Context, phase string, err error) {
 	uc.Logger.Error(ctx, "环节错误", "phase", phase, "err", err)
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventError, Payload: phase, Err: err})
+}
+
+// writeAudit 隔离审计 sink 的失败，避免可观测性故障影响用户请求。
+func (uc *RunUsecase) writeAudit(ctx context.Context, record LLMAuditRecord) {
+	if uc.Audit == nil {
+		return
+	}
+	if err := uc.Audit.WriteLLM(ctx, record); err != nil {
+		uc.Logger.Error(ctx, "LLM 审计写入失败", "run_id", record.RunID,
+			"iteration", record.Iteration, "phase", record.Phase, "err", err)
+	}
 }
 
 // defaultModelOf 探测 entity.LLM 是否实现可选的 DefaultModel() 方法；

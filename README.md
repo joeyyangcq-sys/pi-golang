@@ -110,12 +110,57 @@ AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run
 
 排错顺序：先确认 `--debug` 的 model 和 prompt 元数据符合预期；再看
 `LOG_LEVEL=debug` 的 `llm 回复` 记录；最后检查返回的 HTTP 状态。缺少
-`LLM_API_KEY` 或 `LLM_MODEL` 时会得到明确的本地错误，不会发出网络请求。
+有效 API key 或 `LLM_MODEL` 时会得到明确的本地错误，不会发出网络请求。
+
+## LLM 输入输出审计
+
+设置 `AUDIT_LOG_FILE` 或传入 `--audit-file` 后，Agent 会为**每轮**模型
+调用写入三类 JSONL 事件：`request`、`response`、`error`。它们共用 `run_id`
+和 `iteration`，请求事件包含最终发给模型的完整 messages（含系统提示词），
+响应事件包含原始 provider 输出、工具调用与 token 用量。
+
+默认 `redacted` 模式只保存长度和 SHA-256 摘要；要保存 prompt、用户输入与
+模型输出原文，必须显式选择 `full`，并将文件目录访问权限制给审计人员。
+
+```bash
+# 安全默认：保留可关联摘要，不保存内容原文
+go run . run --audit-file ./var/audit/llm.jsonl --prompt 'hello'
+
+# 受控调试环境：保存每轮完整 prompt、输入与输出
+go run . run --audit-file ./var/audit/llm.jsonl --audit-content full --prompt 'hello'
+
+# 只看某一次运行的全部模型交互
+jq 'select(.run_id == "<run-id>")' ./var/audit/llm.jsonl
+```
+
+文件以 owner-only 权限创建，并在每条记录后 `Sync`；因此审计可靠性优先于
+最高吞吐。审计写入失败只会产生结构化错误日志，不会中断 Agent 主循环。
+
+## 测试与 Docker 沙盒
+
+```bash
+# Go 单元测试、竞态检查与 Python 黑盒集成测试
+go test ./...
+go test -race ./...
+python3 tests/integration/test_agent_cli.py
+
+# Docker Compose：启动 mock LLM、PostgreSQL 和一次性 Agent demo
+docker compose up --build --abort-on-container-exit pi-agent
+
+# 查看容器运行产生的完整审计日志；结束后清理容器与本地数据库卷
+cat ./var/audit/llm.jsonl
+docker compose down -v
+```
+
+Python 测试和 Compose 都使用仓库内的确定性 mock LLM，不会请求真实 API。
+Compose 提供 PostgreSQL 本地服务供后续审计 sink 接入；当前已验证的审计
+落点是 JSONL 文件，因此启动 demo 不会创建或修改数据库 schema。
 
 ## 插件/事件机制速览
 
 - **16 个钩子**：`OnRunStart/Validated`、`OnTurnStart/End`、`OnConversationBuilt`、`OnIterationStart/End`、`OnMaxIterations`、`OnLLMBefore/After`、`OnFinalAnswer`、`OnToolLookup/NotFound/Before/After`、`OnToolReplyAppended` + `WithRegisterTools`（构建期）。
 - **写一个插件**：实现 `entity.Plugin`（`ID()`）+ 按需实现钩子接口，在 [di.go buildPlugins](internal/infrastructure/di.go) 追加。示例见 [plugin_hello.go](internal/infrastructure/plugin_hello.go)。
+- **快速写 Hook**：可用 `infrastructure.NewFuncPlugin("org/name")` 创建小型内置插件；链式设置器名为 `WithTurnStart`、`WithToolBefore` 等，真正被循环调用的接口方法仍是 `OnTurnStart`、`OnToolBefore`。两者不能同名，这是 Go 方法集的限制。
 - **插件自带工具**：实现 `WithRegisterTools`，工具会经 `mergeTools` 合并进 Agent（同名最后写入胜出）。
 - **订阅事件**：`bus.Subscribe(entity.EventError, handler)` 旁路观察所有环节错误；也可订阅 `iteration.start`、`tool.reply.appended` 等 17 种事件。
 - **错误回传**：工具 `Call` 返回 `IsError=true`、panic、`OnToolLookup/ToolBefore` 拒绝、工具未找到——都转成 `ToolReply` 回传 LLM。
