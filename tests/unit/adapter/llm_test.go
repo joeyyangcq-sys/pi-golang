@@ -1,4 +1,4 @@
-package adapter
+package adapter_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"pi-golang/internal/adapter"
 	"pi-golang/internal/entity"
 )
 
@@ -20,7 +21,7 @@ func TestOpenAIProvider_Chat(t *testing.T) {
 			t.Fatalf("鉴权头错误: %q", got)
 		}
 
-		var request openAIChatRequest
+		var request openAIWireRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("解码请求: %v", err)
 		}
@@ -38,7 +39,7 @@ func TestOpenAIProvider_Chat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI("test-key", server.URL+"/v1", "test-model")
+	provider := adapter.NewOpenAI("test-key", server.URL+"/v1", "test-model")
 	response, err := provider.Chat(context.Background(), entity.ChatRequest{
 		Model: "test-model",
 		Messages: entity.Conversation{
@@ -56,7 +57,7 @@ func TestOpenAIProvider_Chat(t *testing.T) {
 }
 
 func TestOpenAIProvider_ChatReportsConfigurationAndHTTPFailures(t *testing.T) {
-	provider := NewOpenAI("", "https://example.invalid/v1", "test-model")
+	provider := adapter.NewOpenAI("", "https://example.invalid/v1", "test-model")
 	if _, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model"}); err == nil || !strings.Contains(err.Error(), "API key") {
 		t.Fatalf("缺少 key 应返回可操作错误: %v", err)
 	}
@@ -66,7 +67,7 @@ func TestOpenAIProvider_ChatReportsConfigurationAndHTTPFailures(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":{"message":"bad key"}}`))
 	}))
 	defer server.Close()
-	provider = NewOpenAI("test-key", server.URL, "test-model")
+	provider = adapter.NewOpenAI("test-key", server.URL, "test-model")
 	if _, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model"}); err == nil || !strings.Contains(err.Error(), "HTTP 401") {
 		t.Fatalf("HTTP 失败应包含状态码: %v", err)
 	}
@@ -74,7 +75,7 @@ func TestOpenAIProvider_ChatReportsConfigurationAndHTTPFailures(t *testing.T) {
 
 func TestOpenAIProvider_ChatPreservesToolCalls(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		var request openAIChatRequest
+		var request openAIWireRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("解码请求: %v", err)
 		}
@@ -85,7 +86,7 @@ func TestOpenAIProvider_ChatPreservesToolCalls(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewOpenAI("test-key", server.URL, "test-model")
+	provider := adapter.NewOpenAI("test-key", server.URL, "test-model")
 	response, err := provider.Chat(context.Background(), entity.ChatRequest{
 		Model: "test-model",
 		Tools: []entity.Info{{
@@ -102,20 +103,28 @@ func TestOpenAIProvider_ChatPreservesToolCalls(t *testing.T) {
 	}
 }
 
-func TestToOpenAIMessages_PreservesToolCallPair(t *testing.T) {
-	messages := toOpenAIMessages(entity.Conversation{
-		entity.AssistantWithToolCalls("", []entity.ToolCall{{
-			ID:        "call-1",
-			Name:      "echo",
-			Arguments: `{"text":"hi"}`,
-		}}),
+func TestOpenAIProvider_ChatPreservesToolCallPair(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request openAIWireRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatalf("解码请求: %v", err)
+		}
+		if len(request.Messages) != 2 || len(request.Messages[0].ToolCalls) != 1 || request.Messages[0].ToolCalls[0].ID != "call-1" {
+			t.Fatalf("assistant tool call 未保留: %+v", request.Messages)
+		}
+		if request.Messages[1].ToolCallID != "call-1" || request.Messages[1].Role != "tool" {
+			t.Fatalf("tool_call_id 配对错误: %+v", request.Messages)
+		}
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
+	}))
+	defer server.Close()
+	provider := adapter.NewOpenAI("test-key", server.URL, "test-model")
+	_, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model", Messages: entity.Conversation{
+		entity.AssistantWithToolCalls("", []entity.ToolCall{{ID: "call-1", Name: "echo", Arguments: `{"text":"hi"}`}}),
 		entity.ToolReplyForCall("call-1", "echo", "hi"),
-	})
-	if len(messages) != 2 || len(messages[0].ToolCalls) != 1 {
-		t.Fatalf("assistant tool call 未保留: %+v", messages)
-	}
-	if messages[0].ToolCalls[0].ID != "call-1" || messages[1].ToolCallID != "call-1" || messages[1].Role != "tool" {
-		t.Fatalf("tool_call_id 配对错误: %+v", messages)
+	}})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
 	}
 }
 
@@ -124,7 +133,7 @@ func TestAnthropicProvider_Chat(t *testing.T) {
 		if r.URL.Path != "/v1/messages" || r.Header.Get("x-api-key") != "test-key" || r.Header.Get("anthropic-version") != "2023-06-01" {
 			t.Fatalf("Anthropic 请求不正确: %s headers=%v", r.URL.Path, r.Header)
 		}
-		var request anthropicRequest
+		var request anthropicWireRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("解码请求: %v", err)
 		}
@@ -135,7 +144,7 @@ func TestAnthropicProvider_Chat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewAnthropic("test-key", server.URL, "test-model")
+	provider := adapter.NewAnthropic("test-key", server.URL, "test-model")
 	response, err := provider.Chat(context.Background(), entity.ChatRequest{
 		Model:    "test-model",
 		Messages: entity.Conversation{entity.System("系统提示"), entity.User("你好")},
@@ -150,7 +159,7 @@ func TestGeminiProvider_Chat(t *testing.T) {
 		if r.URL.Path != "/v1beta/models/test-model:generateContent" || r.Header.Get("x-goog-api-key") != "test-key" {
 			t.Fatalf("Gemini 请求不正确: %s headers=%v", r.URL.Path, r.Header)
 		}
-		var request geminiRequest
+		var request geminiWireRequest
 		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 			t.Fatalf("解码请求: %v", err)
 		}
@@ -161,7 +170,7 @@ func TestGeminiProvider_Chat(t *testing.T) {
 	}))
 	defer server.Close()
 
-	provider := NewGemini("test-key", server.URL, "test-model")
+	provider := adapter.NewGemini("test-key", server.URL, "test-model")
 	response, err := provider.Chat(context.Background(), entity.ChatRequest{
 		Model:    "test-model",
 		Messages: entity.Conversation{entity.System("系统提示"), entity.User("你好")},
@@ -169,4 +178,37 @@ func TestGeminiProvider_Chat(t *testing.T) {
 	if err != nil || response.Content != "Gemini 回复" || response.Usage.Total != 10 {
 		t.Fatalf("Gemini Chat() = %+v, %v", response, err)
 	}
+}
+
+// Wire structs intentionally model only the fields asserted by the contract;
+// they keep protocol tests independent from adapter implementation details.
+type openAIWireRequest struct {
+	Model    string              `json:"model"`
+	Messages []openAIWireMessage `json:"messages"`
+	Tools    []struct {
+		Function struct {
+			Name string `json:"name"`
+		} `json:"function"`
+	} `json:"tools"`
+}
+type openAIWireMessage struct {
+	Role       string `json:"role"`
+	Content    string `json:"content"`
+	ToolCallID string `json:"tool_call_id"`
+	ToolCalls  []struct {
+		ID string `json:"id"`
+	} `json:"tool_calls"`
+}
+type anthropicWireRequest struct {
+	System    string `json:"system"`
+	MaxTokens int    `json:"max_tokens"`
+	Messages  []struct {
+		Role string `json:"role"`
+	} `json:"messages"`
+}
+type geminiWireRequest struct {
+	SystemInstruction any `json:"systemInstruction"`
+	Contents          []struct {
+		Role string `json:"role"`
+	} `json:"contents"`
 }

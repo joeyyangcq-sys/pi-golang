@@ -1,4 +1,4 @@
-package usecase
+package usecase_test
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/usecase"
 )
 
 // --- 测试替身 ---
@@ -22,10 +23,10 @@ type fakeLLM struct {
 }
 
 type recordingAuditSink struct {
-	records []LLMAuditRecord
+	records []usecase.LLMAuditRecord
 }
 
-func (s *recordingAuditSink) WriteLLM(_ context.Context, record LLMAuditRecord) error {
+func (s *recordingAuditSink) WriteLLM(_ context.Context, record usecase.LLMAuditRecord) error {
 	s.records = append(s.records, record)
 	return nil
 }
@@ -61,9 +62,9 @@ func (f *fakeLLM) callsSnapshot() []entity.ChatRequest {
 func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	llm := &fakeLLM{responses: []entity.ChatResponse{{Content: "最终回答"}}}
 	audit := &recordingAuditSink{}
-	uc := NewRunUsecase(nil, audit)
+	uc := usecase.NewRunUsecase(nil, audit)
 
-	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), RunInput{UserPrompt: "用户输入"}); err != nil {
+	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{UserPrompt: "用户输入"}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if len(audit.records) != 2 {
@@ -295,8 +296,8 @@ func TestExecute_HappyPath_NoTools(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{
 		{Content: "hello back"},
 	}}
-	uc := NewRunUsecase(nopLog{})
-	out, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), RunInput{UserPrompt: "hi"})
+	uc := usecase.NewRunUsecase(nil)
+	out, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{UserPrompt: "hi"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -313,9 +314,9 @@ func TestExecute_ToolSuccess_ToolReplyInConversation(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "ok", Arguments: "{}"}}},
 		{Content: "done"},
 	}}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, nil, nil)
-	out, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -336,9 +337,9 @@ func TestExecute_ToolError_ReturnedToLLM(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "bad", Arguments: "{}"}}},
 		{Content: "recovered"},
 	}}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{errTool{name: "bad"}}, nil, nil)
-	out, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -356,9 +357,9 @@ func TestExecute_ToolPanic_RecoveredAndReturnedToLLM(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "panic", Arguments: "{}"}}},
 		{Content: "recovered"},
 	}}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{panicTool{name: "panic"}}, nil, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	calls := llm.callsSnapshot()
@@ -372,9 +373,9 @@ func TestExecute_ToolNotFound_ReturnedToLLM(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "missing", Arguments: "{}"}}},
 		{Content: "recovered"},
 	}}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, nil, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -390,9 +391,9 @@ func TestExecute_OnToolBeforeRejects_ReturnedToLLM(t *testing.T) {
 		{Content: "recovered"},
 	}}
 	plug := &recordingPlugin{id: "pi/test", toolBeforeErr: errors.New("被白名单拒绝")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -410,9 +411,9 @@ func TestExecute_AllSixteenHooksFire(t *testing.T) {
 		{Content: "done"},
 	}}
 	plug := &recordingPlugin{id: "pi/test"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, []entity.Plugin{plug}, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	// 期望全部 16 个钩子都触发（final.answer 仅在无 ToolCalls 分支触发）
@@ -456,9 +457,9 @@ func TestExecute_AllEventsPublished(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "ok", Arguments: "{}"}}},
 		{Content: "done"},
 	}}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, nil, bus)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	got := rec.list()
@@ -497,9 +498,9 @@ func TestExecute_AllEventsPublished(t *testing.T) {
 func TestExecute_RunStartRewritesPrompt(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", runStartRewrite: "RunStart 改写的 prompt"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "原始"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "原始"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	calls := llm.callsSnapshot()
@@ -517,9 +518,9 @@ func TestExecute_RunStartRewritesPrompt(t *testing.T) {
 func TestExecute_RunStartError_Aborts(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", runStartErr: errors.New("RunStart 致命错误")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err == nil {
 		t.Fatal("RunStart 错误应导致 Execute 返回错误")
 	}
@@ -531,9 +532,9 @@ func TestExecute_RunStartError_Aborts(t *testing.T) {
 func TestExecute_RunValidatedError_Aborts(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", runValidatedErr: errors.New("RunValidated 致命错误")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err == nil {
 		t.Fatal("RunValidated 错误应导致 Execute 返回错误")
 	}
@@ -548,9 +549,9 @@ func TestExecute_ConversationBuiltInjectsHistory(t *testing.T) {
 		id:         "pi/test",
 		convInject: []entity.Message{entity.Assistant("历史消息")},
 	}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	calls := llm.callsSnapshot()
@@ -568,9 +569,9 @@ func TestExecute_ConversationBuiltInjectsHistory(t *testing.T) {
 func TestExecute_ConversationBuiltError_Aborts(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", convBuiltErr: errors.New("ConversationBuilt 致命错误")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err == nil {
 		t.Fatal("ConversationBuilt 错误应导致 Execute 返回错误")
 	}
@@ -582,9 +583,9 @@ func TestExecute_ConversationBuiltError_Aborts(t *testing.T) {
 func TestExecute_IterationStartError_Aborts(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", iterStartErr: errors.New("IterationStart 致命错误")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err == nil {
 		t.Fatal("IterationStart 错误应导致 Execute 返回错误")
 	}
@@ -596,9 +597,9 @@ func TestExecute_IterationStartError_Aborts(t *testing.T) {
 func TestExecute_FinalAnswerRewritesAnswer(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "原始答案"}}}
 	plug := &recordingPlugin{id: "pi/test", finalAnswerRewrite: "改写后的最终答案"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	out, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -613,14 +614,14 @@ func TestExecute_MaxIterationsRewritesFallback(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "ok", Arguments: "{}"}}},
 	}}
 	plug := &recordingPlugin{id: "pi/test", maxIterRewrite: "兜底改写"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := entity.NewAgent(
 		entity.WithLLM(llm),
 		entity.WithTools([]entity.Tool{okTool{name: "ok"}}),
 		entity.WithPlugins([]entity.Plugin{plug}),
 		entity.WithConfig(entity.Config{MaxIterations: 1}),
 	)
-	out, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -636,9 +637,9 @@ func TestExecute_ToolLookupRewritesName(t *testing.T) {
 		{Content: "done"},
 	}}
 	plug := &recordingPlugin{id: "pi/test", toolLookupRewrite: "real"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{aliasTool{}}, []entity.Plugin{plug}, nil)
-	out, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -657,9 +658,9 @@ func TestExecute_ToolLookupError_RejectsTool(t *testing.T) {
 		{Content: "recovered"},
 	}}
 	plug := &recordingPlugin{id: "pi/test", toolLookupErr: errors.New("ToolLookup 拒绝")}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -675,9 +676,9 @@ func TestExecute_ToolNotFoundRewritesReply(t *testing.T) {
 		{Content: "recovered"},
 	}}
 	plug := &recordingPlugin{id: "pi/test", notFoundRewrite: "工具不存在，请用 ok"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
@@ -693,9 +694,9 @@ func TestExecute_ToolReplyAppendedFires(t *testing.T) {
 		{Content: "done"},
 	}}
 	plug := &recordingPlugin{id: "pi/test"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, []entity.Plugin{plug}, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	fired := plug.firedList()
@@ -713,9 +714,9 @@ func TestExecute_ToolReplyAppendedFires(t *testing.T) {
 func TestExecute_TurnStartRewritesPrompt(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{{Content: "ok"}}}
 	plug := &recordingPlugin{id: "pi/test", promptRewrite: "重写后的 prompt"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	if _, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "原始"}); err != nil {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "原始"}); err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
 	calls := llm.callsSnapshot()
@@ -733,9 +734,9 @@ func TestExecute_TurnStartRewritesPrompt(t *testing.T) {
 func TestExecute_LLMError_AbortsAndTurnEndFires(t *testing.T) {
 	llm := &fakeLLM{model: "m", err: errors.New("provider 挂了")}
 	plug := &recordingPlugin{id: "pi/test"}
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := newAgentWith(llm, nil, []entity.Plugin{plug}, nil)
-	_, err := uc.Execute(context.Background(), agent, RunInput{UserPrompt: "go"})
+	_, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err == nil {
 		t.Fatal("LLM 错误应导致 Execute 返回错误")
 	}
@@ -752,16 +753,16 @@ func TestExecute_LLMError_AbortsAndTurnEndFires(t *testing.T) {
 }
 
 func TestExecute_NilAgent_ReturnsError(t *testing.T) {
-	uc := NewRunUsecase(nopLog{})
-	if _, err := uc.Execute(context.Background(), nil, RunInput{}); err == nil {
+	uc := usecase.NewRunUsecase(nil)
+	if _, err := uc.Execute(context.Background(), nil, usecase.RunInput{}); err == nil {
 		t.Fatal("nil agent 应返回错误")
 	}
 }
 
 func TestExecute_NilLLM_ReturnsErrLLMNotConfigured(t *testing.T) {
-	uc := NewRunUsecase(nopLog{})
+	uc := usecase.NewRunUsecase(nil)
 	agent := entity.NewAgent()
-	if _, err := uc.Execute(context.Background(), agent, RunInput{}); !errors.Is(err, entity.ErrLLMNotConfigured) {
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{}); !errors.Is(err, entity.ErrLLMNotConfigured) {
 		t.Fatalf("应返回 ErrLLMNotConfigured, 得到 %v", err)
 	}
 }

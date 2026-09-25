@@ -27,8 +27,7 @@ pi-golang/
     │   ├── plugin.go                #   Plugin + 6 阶段钩子 + PluginStateStore
     │   └── event.go                 #   Event + EventBus + EventType
     ├── usecase/                     # 🟠 Layer 2: 应用层
-    │   ├── run.go                   #   RunUsecase（钩子编排 + 事件发布 + 错误回传）
-    │   └── run_test.go              #   单元测试
+    │   └── run.go                   #   RunUsecase（钩子编排 + 事件发布 + 错误回传）
     ├── prompt/                      #   最小 PromptArtifact（内置提示词 + SHA-256）
     ├── adapter/                     # 🟢 Layer 3: 接口适配层
     │   ├── llm.go                   #   OpenAI 兼容文本 Chat Completions
@@ -42,6 +41,14 @@ pi-golang/
         ├── plugin_hello.go          #   示例插件（工具+钩子+事件订阅+状态）
         ├── logger.go                #   slog shim
         └── di.go                    #   Graph + Build + NewAgent + mergeTools
+    └── tests/
+        ├── unit/                    #   与业务实现分离的 Go 单元测试
+        │   ├── adapter/             #   LLM 协议黑盒测试（httptest）
+        │   ├── entity/              #   Agent / Conversation 行为测试
+        │   ├── infrastructure/      #   配置、插件、事件、审计 sink 测试
+        │   ├── prompt/               #   PromptArtifact 测试
+        │   └── usecase/              #   Agent 循环与 hook 行为测试
+        └── integration/             #   Python CLI 黑盒测试与 mock LLM
 ```
 
 依赖方向严格**由外向内**：`infrastructure → adapter/usecase → entity`。
@@ -139,9 +146,15 @@ jq 'select(.run_id == "<run-id>")' ./var/audit/llm.jsonl
 ## 测试与 Docker 沙盒
 
 ```bash
-# Go 单元测试、竞态检查与 Python 黑盒集成测试
+# Go 单元测试（测试代码位于 tests/unit，不混入 internal 业务目录）
 go test ./...
 go test -race ./...
+
+# 只运行某一层测试；调试时先缩小范围，再加 -run 定位用例
+go test ./tests/unit/usecase -run TestExecute_ToolSuccess -v
+go test ./tests/unit/adapter -run TestAnthropicProvider -v
+
+# Python CLI 黑盒集成测试（需要 go 与本地回环网络）
 python3 tests/integration/test_agent_cli.py
 
 # Docker Compose：启动 mock LLM、PostgreSQL 和一次性 Agent demo
@@ -155,6 +168,17 @@ docker compose down -v
 Python 测试和 Compose 都使用仓库内的确定性 mock LLM，不会请求真实 API。
 Compose 提供 PostgreSQL 本地服务供后续审计 sink 接入；当前已验证的审计
 落点是 JSONL 文件，因此启动 demo 不会创建或修改数据库 schema。
+
+### 测试目录约定与调试
+
+业务包目录只放生产代码；Go 测试按被测层放在 `tests/unit`，包名使用
+`<package>_test`，只通过公开接口断言可观察行为，避免测试依赖未导出实现。
+因此 `go test ./...` 仍会自动发现全部单元测试，但打开业务目录时不会被大量
+测试文件打断。协议测试使用 `httptest`，不会请求真实 LLM；如果本机沙盒禁止
+回环监听，请在允许本地网络的终端运行该命令。
+
+Agent 每轮的 prompt、请求、响应和错误会进入审计 sink；默认只写长度/hash
+摘要，调试原文时显式设置 `--audit-content full`，并注意日志中可能含敏感数据。
 
 ## 插件/事件机制速览
 
@@ -174,7 +198,7 @@ Compose 提供 PostgreSQL 本地服务供后续审计 sink 接入；当前已验
 - ✅ `go vet ./...` 0 warnings
 - ✅ `gofmt -l .` 0 files
 - ✅ `golangci-lint run ./...` 0 issues
-- ✅ `go test ./...` 全绿（24 个测试：16 钩子全触发 / 17 事件全发布 / 错误回传 / panic 恢复 / 致命终止 / 改写数据）
+- ✅ `go test ./...` 全绿（覆盖 LLM 协议、Agent 循环、16 个 Hook、17 类事件、错误回传、panic 恢复、审计 sink 与配置）
 - ✅ Entity 层仅依赖 Go 标准库
 
 ## 下一步

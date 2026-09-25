@@ -1,13 +1,17 @@
-package infrastructure
+package infrastructure_test
 
-import "testing"
+import (
+	"testing"
+
+	"pi-golang/internal/infrastructure"
+)
 
 func TestLoad_UsesProviderSpecificAPIKey(t *testing.T) {
 	t.Setenv("LLM_PROVIDER", "deepseek")
 	t.Setenv("LLM_API_KEY", "")
 	t.Setenv("DEEPSEEK_API_KEY", "deepseek-key")
 
-	cfg, err := Load()
+	cfg, err := infrastructure.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
@@ -19,7 +23,7 @@ func TestLoad_UsesProviderSpecificAPIKey(t *testing.T) {
 func TestConfig_WithLLMOverrides(t *testing.T) {
 	t.Setenv("LLM_API_KEY", "")
 	t.Setenv("GEMINI_API_KEY", "gemini-key")
-	cfg := Config{LLM: LLMConfig{
+	cfg := infrastructure.Config{LLM: infrastructure.LLMConfig{
 		Provider: "openai",
 		APIKey:   "env-key",
 		BaseURL:  "https://old.example/v1",

@@ -139,7 +139,7 @@
 | `LLM.Chat` 本身 err | 终止运行 + 发布 `EventError` + 触发 `OnTurnEnd` | —（终止） |
 | 钩子自身 panic | `runHook` recover → 转 err → 按上述策略处理 | 视环节而定 |
 
-对应测试见 [usecase/run_test.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/usecase/run_test.go)：
+对应测试见 [tests/unit/usecase/run_test.go](tests/unit/usecase/run_test.go)：
 `TestExecute_ToolError_ReturnedToLLM`、`TestExecute_ToolPanic_RecoveredAndReturnedToLLM`、
 `TestExecute_ToolNotFound_ReturnedToLLM`、`TestExecute_OnToolBeforeRejects_ReturnedToLLM`、
 `TestExecute_ToolLookupError_RejectsTool`、`TestExecute_ToolNotFoundRewritesReply`、

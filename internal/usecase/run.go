@@ -1,15 +1,32 @@
-// Package usecase 实现应用层业务逻辑。
+// Package usecase 实现 Agent 的应用层用例。
 //
-// 本精简骨架只提供一个用例：RunUsecase，驱动一次完整的
-// "用户 prompt → LLM → 可选工具调用 → 最终答案"循环。
+// 背景：Agent 本身（internal/entity.Agent）只保存配置、LLM、工具和插件，
+// 不应该知道一次请求要先构造对话、再调用模型、再执行工具，也不应该依赖
+// OpenAI、Anthropic 等具体协议。真正把这些零件串起来的地方就是 usecase 层。
+// 这种分层让同一个 Agent 可以替换 LLM、工具、事件总线和审计存储，而不改变
+// 核心循环；也让 CLI、HTTP 服务或 Python 集成都只需要调用一个用例入口。
 //
-// 本文件同时是插件/事件机制与错误回传策略的"编排中心"：
-//   - 在循环的 16 个时间点按需类型断言并触发全部钩子（可改主流程数据）；
-//   - 在每个时间点向 EventBus 发布对应事件（只读观察旁路）；
-//   - 工具路径上的所有错误（Call 报错、panic、OnToolLookup/ToolBefore 拒绝、
-//     工具未找到）都转成 ToolReply 追加进对话，回传给 LLM；
-//   - 致命钩子（RunStart/RunValidated/TurnStart/ConversationBuilt/IterationStart）
-//     返回 err 会直接终止 Execute；其余钩子错误经 EventBus 广播 + 日志，不阻断。
+// 本文件目前提供一个主要用例：RunUsecase.Execute。它实现一个最小 ReAct
+// （Reason + Act）循环：
+//
+//  1. 运行级插件先检查或改写用户 prompt；
+//  2. 把 system prompt、user prompt 和插件注入内容组成 Conversation；
+//  3. 每轮把当前对话和工具 schema 发送给 LLM；
+//  4. 没有 tool call 时把模型文本作为最终答案；有 tool call 时执行工具，
+//     把 assistant 的 tool call 和 tool reply 追加回对话，再进入下一轮；
+//  5. 达到 MaxIterations 仍没有答案时返回可被插件改写的兜底文本。
+//
+// 这个文件也是插件、事件和错误策略的编排中心：
+//
+//   - 插件 Hook 是“可修改”的同步扩展点。Usecase 通过小接口类型断言，插件只需
+//     实现自己关心的 Hook；Hook 可以改写 prompt、请求、响应、工具名或工具结果。
+//   - EventBus 是“只观察”的旁路。它适合做指标、调试、审计和 UI 进度通知，
+//     订阅者不能替换主流程数据，也不应该阻断 Agent。
+//   - 工具错误（返回 IsError、panic、未找到、插件拒绝）会变成 ToolReply，
+//     让 LLM 有机会自行修正参数或选择别的工具；模型调用错误和致命 Hook 错误
+//     则结束本次运行。
+//   - 每次 LLM 调用前后都可写入 LLMAuditSink。审计是旁路能力，写入失败只记录
+//     日志，不会因为日志或数据库不可用而改变用户请求结果。
 package usecase
 
 import (
@@ -22,8 +39,11 @@ import (
 	"pi-golang/internal/entity"
 )
 
-// Logger 是 usecase 层接受的观测端口。在此声明（而非从单独包导入）
-// 让 usecase 层完全自包含，除 std + entity 外无出向依赖。
+// Logger 是 usecase 层接受的观测端口。
+//
+// 这里刻意只声明四个级别，而不直接依赖 slog、zap 或某个基础设施包，
+// 这样应用层仍然可以保持可测试、可替换。Infrastructure 层负责把它接到
+// 控制台、文件或结构化日志系统；测试则可以传 nil 使用 no-op logger。
 type Logger interface {
 	Debug(ctx context.Context, msg string, args ...any)
 	Info(ctx context.Context, msg string, args ...any)
@@ -32,12 +52,19 @@ type Logger interface {
 }
 
 // RunInput 是 RunUsecase.Execute 的入参包。
+//
+// 当前最小实现只有用户文本，但保留独立输入结构是为了后续加入会话 ID、
+// trace ID、取消策略或历史消息时不破坏 Execute 的调用形态。
 type RunInput struct {
 	// UserPrompt 是用户刚输入的文本。
 	UserPrompt string
 }
 
-// RunOutput 是一次成功 Agent 运行的结果。
+// RunOutput 是一次 Agent 运行的结果。
+//
+// 成功时 FinalAnswer 是最终文本；Iterations 是实际完成的 LLM 轮数，Elapsed
+// 是从 Execute 进入到返回的墙钟耗时。发生错误时也可能带有已经完成的轮数，
+// 调用方应优先检查 Execute 返回的 error，而不是仅凭 FinalAnswer 判断成功。
 type RunOutput struct {
 	// FinalAnswer 是要展示给用户的助手文本。
 	FinalAnswer string
@@ -47,14 +74,22 @@ type RunOutput struct {
 	Elapsed time.Duration
 }
 
-// RunUsecase 封装"运行 Agent 一次"用例的依赖。
+// RunUsecase 封装“运行 Agent 一次”用例的依赖。
+//
+// Logger 和 Audit 都是端口（port）：具体输出位置由外层组装。RunUsecase 不
+// 创建数据库连接、不读取环境变量，也不选择 provider；这些都属于
+// Infrastructure/Adapter 的职责。这样可以在单元测试中注入 fake LLM、fake
+// logger 和内存审计 sink，确定性地验证整个循环。
 type RunUsecase struct {
 	Logger Logger
 	Audit  LLMAuditSink
 }
 
-// NewRunUsecase 用给定 logger 构造 RunUsecase。log 为 nil 时使用 no-op
-// logger，调用方无需 nil 检查。
+// NewRunUsecase 用给定 logger 和可选审计 sink 构造 RunUsecase。
+//
+// audit 采用可选参数是为了兼容最小调用方：不需要审计时可以只传 logger；
+// 传入多个 sink 时当前实现只使用第一个，避免一次请求被隐式写入多个地方。
+// log 为 nil 时使用 no-op logger，因此 Execute 内部不需要到处做 nil 检查。
 func NewRunUsecase(log Logger, audit ...LLMAuditSink) *RunUsecase {
 	if log == nil {
 		log = nopLog{}
@@ -66,8 +101,33 @@ func NewRunUsecase(log Logger, audit ...LLMAuditSink) *RunUsecase {
 	return &RunUsecase{Logger: log, Audit: sink}
 }
 
-// Execute 驱动完整 Agent 循环，在 16 个时间点全部触发钩子 + 发布事件。
-// 详见 entity/plugin.go 顶部文档的触发时机总览图。
+// Execute 驱动一次完整 Agent 运行。
+//
+// 下面的代码按“前置校验 → 会话构造 → 迭代循环 → 工具分发 → 结束收尾”
+// 的顺序展开，尽量保持与插件文档中的时间线一致。理解这条时间线很重要：
+// Hook 的返回值只有在对应阶段成功时才会替换主流程数据；EventBus 只收到
+// 观察事件；LLMAuditSink 记录的是模型交互证据而不是最终 Hook 改写结果。
+//
+// 一次正常运行的核心数据流如下：
+//
+//	RunInput.UserPrompt
+//	    ↓ RunStart / TurnStart（可改写）
+//	Conversation(system + user + history)
+//	    ↓ LLMBefore（可改写请求）
+//	LLM.Chat
+//	    ↓ LLMAfter（可改写响应）
+//	文本答案 ───────────────→ FinalAnswer → RunOutput
+//	工具调用 → dispatchTool → ToolReply 追加回 Conversation → 下一轮
+//
+// 错误处理分成两类：
+//   - 致命错误：LLM 未配置、LLM.Chat 失败、RunStart/RunValidated/TurnStart/
+//     ConversationBuilt/IterationStart 返回错误，运行立即结束；
+//   - 可恢复错误：工具失败、工具 panic、工具级 Hook 拒绝、非致命 Hook 失败，
+//     会记录 EventError/日志，并尽量把错误作为上下文交给 LLM 继续决策。
+//
+// Execute 会在已经进入 turn 的终止路径调用 OnTurnEnd；最早的 Agent nil 或
+// LLM 未配置检查可能发生在 turn 开始前，因此不应假设所有失败都触发相同的
+// Hook 序列。详见 internal/entity/plugin.go 的 Hook 时机总览。
 func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput) (out RunOutput, err error) {
 	started := time.Now()
 	defer func() { out.Elapsed = time.Since(started) }()
@@ -77,8 +137,12 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		return out, errors.New("usecase: agent 为 nil")
 	}
 
+	// 读取副本，保证一次 Execute 期间插件列表稳定；如果外层并发修改 Agent，
+	// 本轮仍使用进入时看到的快照。
 	plugins := a.Plugins()
 	bus := a.EventBus()
+	// RunID 把同一轮中的 request/response/error 审计记录串起来。它不是鉴权
+	// token，只用于日志检索和问题复盘。
 	runID := newRunID()
 
 	// ================================================================
@@ -107,7 +171,8 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	}
 
 	// ================================================================
-	// LLM 后端存在性校验
+	// LLM 后端存在性校验。放在 RunStart 之后，是为了让插件有机会在真正
+	// 启动前做 prompt 预处理或拒绝请求；但没有 LLM 时不会进入 TurnStart。
 	// ================================================================
 	if a.LLM() == nil {
 		return out, entity.ErrLLMNotConfigured
@@ -162,7 +227,8 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		prompt = in.UserPrompt
 	}
 
-	// 构造对话
+	// 构造第一版对话。Conversation 是后续循环的唯一事实来源：每轮模型响应
+	// 和工具结果都会 append 到这里，而不是另起一份“临时历史”。
 	conv := entity.Conversation{}
 	if cfg.SystemPrompt != "" {
 		conv = conv.Append(entity.System(cfg.SystemPrompt))
@@ -229,6 +295,10 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 
 		// ============================================================
 		// ⑥ CtxCancelled — ctx.Done() 命中
+		//
+		// 在每轮真正调用 provider 前检查 context，避免取消后继续发网络请求。
+		// provider 自身也会收到同一个 ctx，因此请求已经发出后仍能由 adapter
+		// 继续负责超时/取消传播。
 		// ============================================================
 		select {
 		case <-ctx.Done():
@@ -268,7 +338,9 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMBefore, Payload: req})
 
 		// ============================================================
-		// LLM.Chat 调用
+		// LLM.Chat 调用。审计 request 在调用前写入，error 在失败分支写入，
+		// response 在拿到 provider 原始响应后立即写入；因此即使后面的
+		// LLMAfter Hook 改写响应，审计仍保留真实 provider 输出。
 		// ============================================================
 		uc.writeAudit(ctx, LLMAuditRecord{
 			RunID:      runID,
@@ -366,6 +438,10 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 
 		// ============================================================
 		// 工具阶段 — 遍历每个 ToolCall
+		//
+		// 先追加 assistant tool_calls，再追加每个 tool reply。这一顺序是
+		// OpenAI-compatible 协议要求的消息配对格式，也是下一轮 LLM 能理解
+		// 工具执行结果的关键。
 		// ============================================================
 		for _, tc := range resp.ToolCalls {
 			conv = uc.dispatchTool(ctx, a, plugins, bus, tools, tc, conv)
@@ -429,12 +505,23 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	return out, nil
 }
 
-// dispatchTool 处理一次工具调用，覆盖 6 个工具级时间点：
+// dispatchTool 处理模型返回的一个 ToolCall，覆盖 6 个工具级时间点：
 //
 //	⑫ ToolLookup → ⑬ ToolNotFound → ⑭ ToolBefore → Tool.Call → ⑮ ToolAfter → ⑯ ToolReplyAppended
 //
-// 所有错误路径都把错误信息作为 ToolReply 追加进对话回传 LLM。
-// 返回追加后的新对话。
+// 工具调用是“当前迭代内”的子流程：它不会自己再次调用 LLM，只负责把
+// 一个 tool call 变成一条 tool reply。Execute 在处理完本轮所有 tool call
+// 后，才把完整 Conversation 交给下一轮模型。
+//
+// 所有可恢复错误路径都把错误信息作为 ToolReply 追加进对话并回传 LLM：
+//   - lookup Hook 拒绝：不执行工具；
+//   - 工具未找到：允许 ToolNotFound Hook 改写提示；
+//   - before Hook 拒绝：不执行工具；
+//   - Tool.Call 返回 IsError 或 panic：转为错误 reply；
+//   - after/reply Hook 失败：保留已有结果并继续。
+//
+// 返回值是追加后的新对话。Conversation 使用值语义，因此调用方必须接住
+// 返回值；仅修改局部变量不会影响 Execute 持有的历史。
 func (uc *RunUsecase) dispatchTool(
 	ctx context.Context,
 	a *entity.Agent,
@@ -446,7 +533,10 @@ func (uc *RunUsecase) dispatchTool(
 ) entity.Conversation {
 	// ================================================================
 	// ⑫ ToolLookup — 按名查找工具之前
-	//    钩子可改 ToolName（路由/别名）；err=拒绝工具（错误回传 LLM）
+	//
+	// 这是工具路由层，而不是权限执行层：插件可以把模型请求的别名映射
+	// 到真实名称，也可以依据策略拒绝当前调用。拒绝只影响这个 ToolCall，
+	// 不会把整个 Agent 运行判为失败。
 	// ================================================================
 	lookupInfo := entity.ToolLookupInfo{ToolCallID: tc.ID, ToolName: tc.Name}
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventToolLookup, Payload: lookupInfo})
@@ -513,7 +603,11 @@ func (uc *RunUsecase) dispatchTool(
 
 	// ================================================================
 	// ⑭ ToolBefore — Tool.Call 之前
-	//    钩子可改 req；err=拒绝工具（错误回传 LLM）
+	//
+	// 这是最适合做参数校验、白名单、限流和脱敏的阶段。Hook 可以返回
+	// 修改后的 Request；返回 error 时不执行 Tool.Call，而是把拒绝原因
+	// 作为 ToolReply 交给 LLM。多个插件按注册顺序串联，后一个插件看到
+	// 前一个插件返回的 Request。
 	// ================================================================
 	blocked := false
 	for _, p := range plugins {
@@ -543,6 +637,10 @@ func (uc *RunUsecase) dispatchTool(
 
 	// ================================================================
 	// Tool.Call（带 panic 恢复）
+	//
+	// 工具属于扩展代码，不能假设它永远遵守“不 panic”的约定。这里统一
+	// recover，避免一个插件拖垮整个 Agent；panic 文本会进入错误 ToolReply，
+	// 但不会把堆栈原样写入用户答案。
 	// ================================================================
 	result := uc.callToolSafe(ctx, t, toolReq)
 	if result.IsError {
@@ -601,7 +699,11 @@ func (uc *RunUsecase) dispatchTool(
 }
 
 // callToolSafe 调用 Tool.Call 并 recover 任意 panic，转成错误 Result。
-// 这保证一个崩溃的工具不会拖垮整个 Agent，且错误信息能回传 LLM。
+//
+// 工具是用户或插件提供的边界代码，panic 不能穿透应用层循环。这里把 panic
+// 转成普通的 IsError=true 结果，使调用方可以沿用同一条“记录错误 → 追加
+// ToolReply → 让 LLM 修正”的路径。recover 只负责隔离崩溃，不负责判断是否
+// 应重试；重试策略由下一轮 LLM 决定。
 func (uc *RunUsecase) callToolSafe(ctx context.Context, t entity.Tool, r entity.Request) (result entity.Result) {
 	defer func() {
 		if rc := recover(); rc != nil {
@@ -616,11 +718,13 @@ func (uc *RunUsecase) callToolSafe(ctx context.Context, t entity.Tool, r entity.
 	return t.Call(ctx, r)
 }
 
-// runHook 安全执行一个钩子调用：recover panic + 发布错误事件。
-// 使用命名返回值以便 defer 内 recover 时能把 panic 转成 err 返回
-// （否则 panic 会被吞掉、误当成功）。phase 用于日志与事件。
-// panic 时返回 T 的零值 + 非 nil 错误；调用方约定仅在 err==nil 时
-// 才使用返回的 T，故零值不会污染主流程。
+// runHook 安全执行一个钩子调用：recover panic + 返回错误。
+//
+// Hook 由外部插件实现，既可能正常返回业务错误，也可能直接 panic。这里
+// 用命名返回值让 defer 在 recover 后把 panic 转成 err；否则 panic 被吞掉
+// 后可能被调用方误认为 Hook 成功。panic 时返回 T 的零值，调用方约定只有
+// err == nil 才采纳返回值，因此不会把不完整数据写入主流程。phase 同时用于
+// 日志和 EventError，帮助排查“哪个插件在哪个阶段失败”。
 //
 // 注：Go 方法不允许带类型参数，故这里用包级泛型函数，并把 uc 作为
 // 首参传入以复用其 Logger 与 publishError。
@@ -645,7 +749,10 @@ func runHook[T any](
 }
 
 // runTurnEnd 触发所有 OnTurnEnd 钩子并发布 TurnEnd 事件。
-// 在 Execute 的每条终止路径上调用。钩子错误仅记录。
+//
+// 它是 Execute 的统一收尾点：成功、LLM 错误、context 取消、致命 Hook 错误
+// 和达到最大轮数都会尽量经过这里。TurnEnd 本身是非致命阶段；即使某个
+// 插件在收尾时失败，也只能记录错误，不能覆盖 Execute 原本要返回的结果。
 func (uc *RunUsecase) runTurnEnd(
 	plugins []entity.Plugin,
 	bus entity.EventBus,
@@ -669,6 +776,9 @@ func (uc *RunUsecase) runTurnEnd(
 }
 
 // publish 向事件总线发布事件；bus 为 nil 时跳过。
+//
+// 事件总线是观察者旁路，不返回错误，也不允许订阅者修改主流程。具体实现
+// 负责隔离订阅者 panic；Usecase 只负责在正确的时间点发送事件。
 func (uc *RunUsecase) publish(bus entity.EventBus, ctx context.Context, e entity.Event) {
 	if bus == nil {
 		return
@@ -677,12 +787,20 @@ func (uc *RunUsecase) publish(bus entity.EventBus, ctx context.Context, e entity
 }
 
 // publishError 发布一个 EventError 事件并记录日志。
+//
+// 这是统一的错误观测出口，不等同于“让 Execute 失败”：调用方仍然决定
+// 当前错误是致命、当前工具可恢复，还是仅记录后继续。这样日志、事件订阅
+// 和主流程的错误语义不会互相耦合。
 func (uc *RunUsecase) publishError(bus entity.EventBus, ctx context.Context, phase string, err error) {
 	uc.Logger.Error(ctx, "环节错误", "phase", phase, "err", err)
 	uc.publish(bus, ctx, entity.Event{Type: entity.EventError, Payload: phase, Err: err})
 }
 
 // writeAudit 隔离审计 sink 的失败，避免可观测性故障影响用户请求。
+//
+// 审计 sink 可能写文件、PostgreSQL 或远程队列，任何一种都可能暂时不可用。
+// Execute 的正确性不依赖审计落盘，因此这里只记录错误并继续。记录顺序是
+// request → response/error；RunID + Iteration + Phase 用于把一次交互重建出来。
 func (uc *RunUsecase) writeAudit(ctx context.Context, record LLMAuditRecord) {
 	if uc.Audit == nil {
 		return
@@ -693,8 +811,11 @@ func (uc *RunUsecase) writeAudit(ctx context.Context, record LLMAuditRecord) {
 	}
 }
 
-// defaultModelOf 探测 entity.LLM 是否实现可选的 DefaultModel() 方法；
-// 不支持则返回空串。
+// defaultModelOf 探测 entity.LLM 是否实现可选的 DefaultModel() 方法。
+//
+// entity.LLM 只要求 Chat，避免把 provider 配置细节强加给领域层。Adapter
+// 如果知道默认模型，可以额外实现 DefaultModel；这里通过小接口探测，旧的
+// 或测试用 LLM 不实现该方法时仍然可以工作，最终由 provider 自己报配置错误。
 func defaultModelOf(l entity.LLM) string {
 	type withDefaultModel interface {
 		DefaultModel() string
@@ -705,7 +826,11 @@ func defaultModelOf(l entity.LLM) string {
 	return ""
 }
 
-// toolInfos 按序提取每个工具的 Info()。空时返回 nil。
+// toolInfos 按序提取每个工具的 Info()，生成发送给 LLM 的工具 schema 摘要。
+//
+// 只把描述信息交给模型，不把 Tool 接口或函数指针暴露给 Adapter。顺序保持
+// 与 Agent.Tools 一致，便于调试和复现实验；没有工具时返回 nil，让 JSON
+// provider 省略 tools 字段而不是发送空对象。
 func toolInfos(tools []entity.Tool) []entity.Info {
 	if len(tools) == 0 {
 		return nil
@@ -717,7 +842,11 @@ func toolInfos(tools []entity.Tool) []entity.Info {
 	return out
 }
 
-// findToolByName 在工具列表里按名查找，找不到返回 nil。
+// findToolByName 在本轮快照的工具列表里按名查找，找不到返回 nil。
+//
+// 查找发生在 ToolLookup Hook 之后，因此传入的 name 可能已经被插件改写。
+// 当前策略是线性查找并使用第一个匹配项；工具数量通常很小，保持简单比
+// 为一次请求维护额外 map 更容易观察和调试。
 func findToolByName(tools []entity.Tool, name string) entity.Tool {
 	for _, t := range tools {
 		if t.Info().Name == name {
@@ -728,6 +857,10 @@ func findToolByName(tools []entity.Tool, name string) entity.Tool {
 }
 
 // truncate 把过长字符串截短以便安全记录日志。
+//
+// 工具错误和 provider 错误可能包含很大的响应体或敏感上下文。日志只需保留
+// 足够诊断的前缀，避免单条异常把日志文件撑大；完整模型交互应通过受控的
+// AuditContentFull 审计配置获取，而不是扩大普通日志字段。
 func truncate(s string, max int) string {
 	if max <= 0 || len(s) <= max {
 		return s
@@ -736,6 +869,10 @@ func truncate(s string, max int) string {
 }
 
 // nopLog 是传给 NewRunUsecase 的 nil logger 时使用的占位实现。
+//
+// 它不是业务 logger，也不会缓存或丢弃之外地处理数据；存在它只是为了让
+// Execute 的每条路径都能直接记录诊断信息，同时让 CLI/测试在不关心日志时
+// 无需构造额外依赖。
 type nopLog struct{}
 
 func (nopLog) Debug(context.Context, string, ...any) {}

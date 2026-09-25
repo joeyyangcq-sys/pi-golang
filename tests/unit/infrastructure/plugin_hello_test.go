@@ -1,14 +1,15 @@
-package infrastructure
+package infrastructure_test
 
 import (
 	"context"
 	"testing"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/infrastructure"
 )
 
 func TestHelloPlugin_IDAndTools(t *testing.T) {
-	p := NewHelloPlugin(nil, nil)
+	p := infrastructure.NewHelloPlugin(nil, nil)
 	if p.ID() != "pi/hello" {
 		t.Fatalf("ID 应为 pi/hello, 得到 %s", p.ID())
 	}
@@ -19,7 +20,8 @@ func TestHelloPlugin_IDAndTools(t *testing.T) {
 }
 
 func TestHelloTool_CallSuccess(t *testing.T) {
-	tool := helloTool{}
+	p := infrastructure.NewHelloPlugin(nil, nil)
+	tool := p.RegisterTools()[0]
 	res := tool.Call(context.Background(), entity.Request{
 		Name:      "hello",
 		Arguments: []byte(`{"name":"Joey"}`),
@@ -33,7 +35,8 @@ func TestHelloTool_CallSuccess(t *testing.T) {
 }
 
 func TestHelloTool_CallBadArgs_ReturnsErrorResult(t *testing.T) {
-	tool := helloTool{}
+	p := infrastructure.NewHelloPlugin(nil, nil)
+	tool := p.RegisterTools()[0]
 	res := tool.Call(context.Background(), entity.Request{
 		Name:      "hello",
 		Arguments: []byte(`{bad json`),
@@ -47,7 +50,7 @@ func TestHelloTool_CallBadArgs_ReturnsErrorResult(t *testing.T) {
 }
 
 func TestHelloPlugin_OnToolAfter_CountsSuccess(t *testing.T) {
-	p := NewHelloPlugin(nil, nil)
+	p := infrastructure.NewHelloPlugin(nil, nil)
 	_, _ = p.OnToolAfter(context.Background(), nil, nil, entity.Request{}, entity.Result{Content: "ok"})
 	_, _ = p.OnToolAfter(context.Background(), nil, nil, entity.Request{}, entity.Result{Content: "err", IsError: true})
 	if p.Count() != 1 {
@@ -56,8 +59,8 @@ func TestHelloPlugin_OnToolAfter_CountsSuccess(t *testing.T) {
 }
 
 func TestHelloPlugin_OnTurnEnd_PersistsCount(t *testing.T) {
-	state := NewInMemoryPluginState()
-	p := NewHelloPlugin(state, nil)
+	state := infrastructure.NewInMemoryPluginState()
+	p := infrastructure.NewHelloPlugin(state, nil)
 	ctx := context.Background()
 	_, _ = p.OnToolAfter(ctx, nil, nil, entity.Request{}, entity.Result{Content: "ok"})
 	_, _ = p.OnTurnEnd(ctx, nil, entity.TurnEndInfo{})
@@ -67,21 +70,14 @@ func TestHelloPlugin_OnTurnEnd_PersistsCount(t *testing.T) {
 	}
 }
 
-func TestMergeTools_LastWriterWins(t *testing.T) {
+func TestFuncPluginTools_LastWriterWins(t *testing.T) {
 	a := stubToolN{name: "a", desc: "1"}
 	b := stubToolN{name: "a", desc: "2"} // 同名，应覆盖
 	c := stubToolN{name: "c", desc: "3"}
-	merged := mergeTools([]entity.Tool{a, b}, []entity.Tool{c})
-	if len(merged) != 2 {
-		t.Fatalf("应合并为 2 个工具, 得到 %d", len(merged))
-	}
-	// 找 a，应是 "2"
-	for _, tt := range merged {
-		if tt.Info().Name == "a" {
-			if tt.Info().Description != "2" {
-				t.Errorf("同名工具 a 应被最后写入覆盖为 2, 得到 %s", tt.Info().Description)
-			}
-		}
+	plugin := infrastructure.NewFuncPlugin("pi/test").WithTools(func() []entity.Tool { return []entity.Tool{a, b} }).WithTools(func() []entity.Tool { return []entity.Tool{c} })
+	merged := plugin.RegisterTools()
+	if len(merged) != 1 || merged[0].Info().Name != "c" {
+		t.Fatalf("后一次 WithTools 应替换前一次工具列表, 得到 %+v", merged)
 	}
 }
 

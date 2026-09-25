@@ -1,14 +1,15 @@
-package infrastructure
+package infrastructure_test
 
 import (
 	"context"
 	"testing"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/infrastructure"
 )
 
 func TestFuncPlugin_WithTurnStartAndTools(t *testing.T) {
-	plugin := NewFuncPlugin("test/func").
+	plugin := infrastructure.NewFuncPlugin("test/func").
 		WithTurnStart(func(_ context.Context, _ *entity.Agent, info entity.TurnStartInfo) (entity.TurnStartInfo, error) {
 			info.UserPrompt = "改写后的输入"
 			return info, nil

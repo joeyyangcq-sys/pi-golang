@@ -1,13 +1,15 @@
-package entity
+package entity_test
 
 import (
 	"context"
 	"testing"
+
+	"pi-golang/internal/entity"
 )
 
 func TestNewAgent_Defaults(t *testing.T) {
-	a := NewAgent()
-	if a.State() != AgentIdle {
+	a := entity.NewAgent()
+	if a.State() != entity.AgentIdle {
 		t.Errorf("默认状态应为 idle, 得到 %s", a.State())
 	}
 	if cfg := a.Config(); cfg.Name != "pi-agent" || cfg.Temperature != 0.7 || cfg.MaxIterations != 5 {
@@ -16,7 +18,7 @@ func TestNewAgent_Defaults(t *testing.T) {
 }
 
 func TestWithPlugins_AndPlugins(t *testing.T) {
-	a := NewAgent(WithPlugins([]Plugin{stubPlugin("pi/x")}))
+	a := entity.NewAgent(entity.WithPlugins([]entity.Plugin{stubPlugin("pi/x")}))
 	if got := len(a.Plugins()); got != 1 {
 		t.Fatalf("应有 1 个插件, 得到 %d", got)
 	}
@@ -29,14 +31,14 @@ func TestWithPlugins_AndPlugins(t *testing.T) {
 }
 
 func TestWithEventBus(t *testing.T) {
-	a := NewAgent(WithEventBus(nil))
+	a := entity.NewAgent(entity.WithEventBus(nil))
 	if a.EventBus() != nil {
 		t.Fatal("nil 事件总线应原样保留")
 	}
 }
 
 func TestFindTool(t *testing.T) {
-	a := NewAgent(WithTools([]Tool{stubTool("a"), stubTool("b")}))
+	a := entity.NewAgent(entity.WithTools([]entity.Tool{stubTool("a"), stubTool("b")}))
 	if a.FindTool("a") == nil {
 		t.Fatal("应能找到工具 a")
 	}
@@ -46,8 +48,8 @@ func TestFindTool(t *testing.T) {
 }
 
 func TestConversationAppend(t *testing.T) {
-	c := Conversation{}
-	c2 := c.Append(User("hi"))
+	c := entity.Conversation{}
+	c2 := c.Append(entity.User("hi"))
 	if len(c) != 0 {
 		t.Fatal("原对话应不变")
 	}
@@ -56,13 +58,13 @@ func TestConversationAppend(t *testing.T) {
 	}
 }
 
-type stubPlugin PluginID
+type stubPlugin entity.PluginID
 
-func (s stubPlugin) ID() PluginID { return PluginID(s) }
+func (s stubPlugin) ID() entity.PluginID { return entity.PluginID(s) }
 
 type stubTool string
 
-func (s stubTool) Info() Info { return Info{Name: string(s)} }
-func (stubTool) Call(_ context.Context, _ Request) Result {
-	return Result{Content: "stub"}
+func (s stubTool) Info() entity.Info { return entity.Info{Name: string(s)} }
+func (stubTool) Call(_ context.Context, _ entity.Request) entity.Result {
+	return entity.Result{Content: "stub"}
 }

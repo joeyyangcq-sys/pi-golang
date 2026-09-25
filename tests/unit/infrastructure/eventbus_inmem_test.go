@@ -1,4 +1,4 @@
-package infrastructure
+package infrastructure_test
 
 import (
 	"context"
@@ -6,10 +6,11 @@ import (
 	"testing"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/infrastructure"
 )
 
 func TestInMemoryEventBus_SubscribeAndPublish(t *testing.T) {
-	bus := NewInMemoryEventBus()
+	bus := infrastructure.NewInMemoryEventBus()
 	var got atomic.Int32
 	bus.Subscribe(entity.EventLLMAfter, func(_ context.Context, _ entity.Event) error {
 		got.Add(1)
@@ -23,7 +24,7 @@ func TestInMemoryEventBus_SubscribeAndPublish(t *testing.T) {
 }
 
 func TestInMemoryEventBus_PanicRecovery(t *testing.T) {
-	bus := NewInMemoryEventBus()
+	bus := infrastructure.NewInMemoryEventBus()
 	var called atomic.Int32
 	bus.Subscribe(entity.EventError, func(_ context.Context, _ entity.Event) error {
 		called.Add(1)
@@ -40,7 +41,7 @@ func TestInMemoryEventBus_PanicRecovery(t *testing.T) {
 }
 
 func TestInMemoryPluginState_GetSet(t *testing.T) {
-	s := NewInMemoryPluginState()
+	s := infrastructure.NewInMemoryPluginState()
 	ctx := context.Background()
 	id := entity.PluginID("pi/test")
 	// 未写过状态应返回空 map（非 nil）

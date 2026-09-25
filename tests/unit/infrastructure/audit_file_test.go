@@ -1,4 +1,4 @@
-package infrastructure
+package infrastructure_test
 
 import (
 	"context"
@@ -8,12 +8,13 @@ import (
 	"time"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/infrastructure"
 	"pi-golang/internal/usecase"
 )
 
 func TestFileAuditSink_RedactsContentByDefault(t *testing.T) {
 	path := t.TempDir() + "/audit/llm.jsonl"
-	sink, err := NewFileAuditSink(path, AuditContentRedacted)
+	sink, err := infrastructure.NewFileAuditSink(path, infrastructure.AuditContentRedacted)
 	if err != nil {
 		t.Fatalf("NewFileAuditSink() error = %v", err)
 	}
@@ -50,7 +51,7 @@ func TestFileAuditSink_RedactsContentByDefault(t *testing.T) {
 
 func TestFileAuditSink_FullContent(t *testing.T) {
 	path := t.TempDir() + "/llm.jsonl"
-	sink, err := NewFileAuditSink(path, AuditContentFull)
+	sink, err := infrastructure.NewFileAuditSink(path, infrastructure.AuditContentFull)
 	if err != nil {
 		t.Fatalf("NewFileAuditSink() error = %v", err)
 	}
