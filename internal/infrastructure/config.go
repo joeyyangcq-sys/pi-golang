@@ -48,17 +48,39 @@ type Config struct {
 // Load 从环境变量读取配置并应用默认值。缺失值会被合理默认值替换；
 // 只有真正的配置错误（如负温度）才报错。
 func Load() (Config, error) {
-	provider := strings.ToLower(env("LLM_PROVIDER", "openai"))
-	apiKey := env("LLM_API_KEY", "")
-	if apiKey == "" {
-		apiKey = providerAPIKey(provider)
+	saved, err := loadPersistedLLMConfig()
+	if err != nil {
+		return Config{}, err
+	}
+	provider := strings.ToLower(strings.TrimSpace(saved.Provider))
+	if provider == "" {
+		provider = "openai"
+	}
+	if value, ok := os.LookupEnv("LLM_PROVIDER"); ok {
+		provider = strings.ToLower(strings.TrimSpace(value))
+	}
+	apiKey := saved.APIKey
+	if value, ok := os.LookupEnv("LLM_API_KEY"); ok {
+		apiKey = strings.TrimSpace(value)
+	} else if providerKey := providerAPIKey(provider); providerKey != "" {
+		// 环境变量中的 provider 专属 key 优先于持久化 key，方便临时切换
+		// provider，也避免把旧 provider 的凭据误发给新 provider。
+		apiKey = providerKey
+	}
+	baseURL := saved.BaseURL
+	if value, ok := os.LookupEnv("LLM_BASE_URL"); ok {
+		baseURL = strings.TrimSpace(value)
+	}
+	model := saved.Model
+	if value, ok := os.LookupEnv("LLM_MODEL"); ok {
+		model = strings.TrimSpace(value)
 	}
 	cfg := Config{
 		LLM: LLMConfig{
 			Provider: provider,
 			APIKey:   apiKey,
-			BaseURL:  env("LLM_BASE_URL", ""),
-			Model:    env("LLM_MODEL", ""),
+			BaseURL:  baseURL,
+			Model:    model,
 		},
 		Agent: AgentConfig{
 			Name:          env("AGENT_NAME", "pi-agent"),
@@ -75,6 +97,24 @@ func Load() (Config, error) {
 		},
 	}
 	return cfg, cfg.Validate()
+}
+
+// NeedsLLMSetup 判断当前配置是否不足以安全发起一次模型请求。
+//
+// 云端 provider 需要 model 和 API key；本地 provider 通常不需要 key，但仍
+// 需要 model。custom 还必须显式提供 base URL，因为程序无法猜测私有网关地址。
+func (c Config) NeedsLLMSetup() bool {
+	if strings.TrimSpace(c.LLM.Model) == "" {
+		return true
+	}
+	switch strings.ToLower(strings.TrimSpace(c.LLM.Provider)) {
+	case "ollama", "lmstudio", "vllm":
+		return false
+	case "custom":
+		return strings.TrimSpace(c.LLM.BaseURL) == ""
+	default:
+		return strings.TrimSpace(c.LLM.APIKey) == ""
+	}
 }
 
 // WithAuditOverrides 返回应用命令行覆盖后的审计配置副本。

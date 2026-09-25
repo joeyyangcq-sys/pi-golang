@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
+	"os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -28,6 +31,12 @@ func main() {
 		return
 	case "providers":
 		fmt.Println(strings.Join(infrastructure.SupportedProviders(), "\n"))
+		return
+	case "setup":
+		code := cmdSetup()
+		if code != 0 {
+			os.Exit(code)
+		}
 		return
 	case "help", "-h", "--help":
 		fmt.Print(strings.TrimSpace(helpText) + "\n")
@@ -76,6 +85,17 @@ func cmdRun(ctx context.Context, args []string) int {
 		return 1
 	}
 	cfg = cfg.WithLLMOverrides(provider, apiKey, baseURL, model)
+	if cfg.NeedsLLMSetup() {
+		if !isInteractive(os.Stdin) {
+			printSetupHint(cfg)
+			return 1
+		}
+		cfg, err = setupLLMInteractively(cfg, os.Stdin, os.Stderr)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "配置 LLM:", err)
+			return 1
+		}
+	}
 	cfg = cfg.WithAuditOverrides(auditFile, auditContent)
 	g, err := infrastructure.BuildWithConfig(cfg)
 	if err != nil {
@@ -116,11 +136,190 @@ func cmdRun(ctx context.Context, args []string) int {
 	return 0
 }
 
+// cmdSetup 显式运行首次配置向导。run 命令在发现配置不完整时也会自动
+// 进入同一个向导；单独的 setup 命令方便用户在更换 provider 或模型时重配。
+func cmdSetup() int {
+	if !isInteractive(os.Stdin) {
+		fmt.Fprintln(os.Stderr, "setup 需要交互式终端；请直接在终端运行 `go run . setup`")
+		return 2
+	}
+	cfg, err := infrastructure.Load()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "加载配置:", err)
+		return 1
+	}
+	if _, err := setupLLMInteractively(cfg, os.Stdin, os.Stderr); err != nil {
+		fmt.Fprintln(os.Stderr, "配置 LLM:", err)
+		return 1
+	}
+	return 0
+}
+
+// setupLLMInteractively 读取最小 LLM 配置并持久化。
+//
+// API key 不会显示在提示符、日志或命令行参数中；在支持 stty 的终端中输入
+// 时关闭回显。配置文件由 infrastructure.SaveLLMConfig 以 0600 权限原子写入。
+// 这是跨平台的本地文件方案；生产环境可把同一个配置接缝替换成 Keychain
+// 或 Secret Service，而不必把 secret 放进环境变量或 shell history。
+func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.Writer) (infrastructure.Config, error) {
+	reader := bufio.NewReader(input)
+	path, err := infrastructure.UserConfigPath()
+	if err != nil {
+		return cfg, err
+	}
+
+	fmt.Fprintln(output, "未检测到完整的 LLM 配置，开始首次设置。")
+	fmt.Fprintf(output, "配置将保存到：%s\n", path)
+	fmt.Fprintln(output, "常用 provider：lmstudio、ollama、vllm、openai、anthropic、gemini、custom")
+
+	previousProvider := strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))
+	provider, err := promptLine(reader, output, "Provider", cfg.LLM.Provider)
+	if err != nil {
+		return cfg, err
+	}
+	provider = strings.ToLower(provider)
+	if provider == "" {
+		return cfg, fmt.Errorf("provider 不能为空")
+	}
+
+	baseURL := cfg.LLM.BaseURL
+	if provider != previousProvider {
+		baseURL = ""
+	}
+	if defaultURL := defaultLocalBaseURL(provider); defaultURL != "" && baseURL == "" {
+		baseURL = defaultURL
+	}
+	baseURL, err = promptLine(reader, output, "Base URL（custom 必填）", baseURL)
+	if err != nil {
+		return cfg, err
+	}
+	if provider == "custom" && baseURL == "" {
+		return cfg, fmt.Errorf("custom provider 必须填写 Base URL，例如 http://127.0.0.1:8000/v1")
+	}
+
+	model, err := promptLine(reader, output, "Model", cfg.LLM.Model)
+	if err != nil {
+		return cfg, err
+	}
+	if model == "" {
+		return cfg, fmt.Errorf("model 不能为空；可先通过 provider 的 /v1/models 查看模型名")
+	}
+
+	apiKey := cfg.LLM.APIKey
+	if providerNeedsAPIKey(provider) {
+		enteredKey, readErr := promptSecretLine(reader, output, "API key（输入时不回显）", apiKey != "")
+		if readErr != nil {
+			return cfg, readErr
+		}
+		if enteredKey != "" {
+			apiKey = enteredKey
+		}
+		if apiKey == "" {
+			return cfg, fmt.Errorf("%s provider 需要 API key", provider)
+		}
+	} else {
+		// 本地服务通常无鉴权。切换 provider 时清掉旧云端 key，避免意外
+		// 通过 Authorization header 发送给本地网关。
+		apiKey = ""
+	}
+
+	cfg.LLM = infrastructure.LLMConfig{
+		Provider: provider,
+		APIKey:   apiKey,
+		BaseURL:  baseURL,
+		Model:    model,
+	}
+	if err := infrastructure.SaveLLMConfig(cfg.LLM); err != nil {
+		return cfg, err
+	}
+	fmt.Fprintln(output, "LLM 配置已保存。下次可直接运行 `go run .`。")
+	return cfg, nil
+}
+
+func promptLine(reader *bufio.Reader, output io.Writer, label, defaultValue string) (string, error) {
+	if defaultValue != "" {
+		fmt.Fprintf(output, "%s [%s]: ", label, defaultValue)
+	} else {
+		fmt.Fprintf(output, "%s: ", label)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	line = strings.TrimSpace(line)
+	if line == "" {
+		return defaultValue, nil
+	}
+	return line, nil
+}
+
+func promptSecretLine(reader *bufio.Reader, output io.Writer, label string, hasExisting bool) (string, error) {
+	if hasExisting {
+		fmt.Fprintf(output, "%s [已保存，回车保留]: ", label)
+	} else {
+		fmt.Fprintf(output, "%s: ", label)
+	}
+	if isInteractive(os.Stdin) {
+		// 直接传参数，不经过 shell；stty 只负责当前终端的回显开关。
+		if err := exec.Command("stty", "-echo").Run(); err == nil {
+			defer func() {
+				_ = exec.Command("stty", "echo").Run()
+				fmt.Fprintln(output)
+			}()
+		}
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return "", err
+	}
+	line = strings.TrimSpace(line)
+	return line, nil
+}
+
+func isInteractive(file *os.File) bool {
+	info, err := file.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0
+}
+
+func providerNeedsAPIKey(provider string) bool {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "ollama", "lmstudio", "vllm", "custom":
+		return false
+	default:
+		return true
+	}
+}
+
+func defaultLocalBaseURL(provider string) string {
+	switch strings.ToLower(strings.TrimSpace(provider)) {
+	case "lmstudio":
+		return "http://127.0.0.1:1234/v1"
+	case "ollama":
+		return "http://127.0.0.1:11434/v1"
+	case "vllm":
+		return "http://127.0.0.1:8000/v1"
+	default:
+		return ""
+	}
+}
+
+func printSetupHint(cfg infrastructure.Config) {
+	path, _ := infrastructure.UserConfigPath()
+	fmt.Fprintln(os.Stderr, "当前 LLM 配置不完整，未启动网络请求。")
+	fmt.Fprintf(os.Stderr, "配置文件位置：%s\n", path)
+	fmt.Fprintln(os.Stderr, "请在交互式终端运行：go run . setup")
+	fmt.Fprintln(os.Stderr, "或显式提供：--provider、--model，以及远程 provider 的 --api-key。")
+	if cfg.LLM.Provider == "lmstudio" {
+		fmt.Fprintln(os.Stderr, "LM Studio 示例：go run . run --provider lmstudio --base-url http://127.0.0.1:1234/v1 --model <模型名> --prompt '你好'")
+	}
+}
+
 const helpText = `
 pi-agent — 精简 Clean Architecture Go AI Agent 骨架
 
 Usage:
   pi-agent run [flags] [--prompt "hello"]  运行一次 agent 会话（默认命令）
+  pi-agent setup                         交互式配置本地或远程 LLM
   pi-agent providers                       列出内置 provider
   pi-agent version                 打印版本并退出
   pi-agent help                    显示本帮助
@@ -137,10 +336,14 @@ Usage:
   LOG_LEVEL            debug | info | warn | error        (默认: info)
   AUDIT_LOG_FILE        JSONL 审计文件路径；为空时不启用
   AUDIT_CONTENT_MODE    redacted | full（默认: redacted）
+  PI_AGENT_CONFIG_FILE  覆盖用户配置文件路径（默认使用 os.UserConfigDir）
 
 调试:
   run --debug 会向 stderr 输出实际使用的 PromptArtifact 元数据和系统提示词。
   设置 LOG_LEVEL=debug 可查看每轮 Agent/LLM 循环的结构化日志。
+	  首次运行或配置不完整时会进入交互式设置；也可单独运行 pi-agent setup。
+  API key 不会回显，配置文件使用 0600 权限保存。非交互终端请使用环境变量
+  或显式 flags，程序不会阻塞等待输入。
 
 run flags:
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。

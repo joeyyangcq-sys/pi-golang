@@ -71,7 +71,15 @@ export LLM_PROVIDER=openai
 export OPENAI_API_KEY='你的 API key'
 export LLM_MODEL='你的模型 ID'
 go run . run -prompt "请用一句话解释 Go interface" --debug
+
+# 也可以首次运行交互式配置；配置会保存到用户配置目录，API key 不回显。
+go run . setup
 ```
+
+如果直接运行 `go run .` 时发现 provider、model 或远程 API key 缺失，CLI 会
+自动进入同一个配置向导。交互式终端之外不会等待输入，而是打印修复提示。
+配置文件默认使用 `os.UserConfigDir()/pi-agent/config.json`，目录权限为 0700、
+文件权限为 0600；可用 `PI_AGENT_CONFIG_FILE` 指定容器或测试中的替代路径。
 
 ## Provider 与 CLI
 
@@ -94,6 +102,7 @@ GEMINI_API_KEY='…' go run . run --provider gemini --model '你的模型 ID' --
 DEEPSEEK_API_KEY='…' go run . run --provider deepseek --model '你的模型 ID' --prompt '你好'
 
 # 本地 OpenAI 兼容端点：无需 API key；--base-url 可接私有网关
+go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' --model '已加载的模型 ID' --prompt '你好'
 go run . run --provider ollama --model '你的模型 ID' --prompt '你好'
 go run . run --provider custom --base-url 'http://localhost:8000/v1' --model '你的模型 ID' --prompt '你好'
 ```
