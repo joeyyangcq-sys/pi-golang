@@ -61,14 +61,38 @@ go test ./...
 # 运行最小文本 Agent 循环。模型名称由你所用账户/网关决定，显式设置
 # 能避免因为 provider 默认值变化造成不可复现的结果。
 export LLM_PROVIDER=openai
-export LLM_API_KEY='你的 API key'
+export OPENAI_API_KEY='你的 API key'
 export LLM_MODEL='你的模型 ID'
 go run . run -prompt "请用一句话解释 Go interface" --debug
 ```
 
-当前接通的是 OpenAI Chat Completions 兼容的纯文本循环（OpenAI 与
-OpenRouter）。Anthropic 和远端工具调用协议仍是后续迭代；本地
-`RunUsecase` 的工具、Hook、事件单元测试不受影响。
+## Provider 与 CLI
+
+参照 Pi 的分层方式，Agent loop 不感知厂商：只按协议族选择 adapter。
+`anthropic` 使用原生 Messages API，`gemini` 使用原生 GenerateContent API；
+其余云端和本地服务复用 OpenAI Chat Completions 适配器，并且 OpenAI
+兼容协议已支持本地工具循环所需的 `tool_calls` / `tool_call_id`。
+
+```bash
+# 查看已内置的 provider 名称
+go run . providers
+
+# Anthropic：也可用 LLM_API_KEY，--api-key 只对这一进程有效
+ANTHROPIC_API_KEY='…' go run . run --provider anthropic --model '你的模型 ID' --prompt '你好'
+
+# Gemini 原生 API
+GEMINI_API_KEY='…' go run . run --provider gemini --model '你的模型 ID' --prompt '你好'
+
+# OpenAI 兼容云端：openrouter、groq、mistral、xai、deepseek、cerebras、zai、kimi、minimax
+DEEPSEEK_API_KEY='…' go run . run --provider deepseek --model '你的模型 ID' --prompt '你好'
+
+# 本地 OpenAI 兼容端点：无需 API key；--base-url 可接私有网关
+go run . run --provider ollama --model '你的模型 ID' --prompt '你好'
+go run . run --provider custom --base-url 'http://localhost:8000/v1' --model '你的模型 ID' --prompt '你好'
+```
+
+Anthropic 与 Gemini 当前先支持文本循环；它们的原生工具/流式载荷留待
+下一阶段。不要将 OpenAI 的工具消息格式直接发送给这两个原生 API。
 
 ## 调试最小循环
 

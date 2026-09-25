@@ -11,7 +11,7 @@ import (
 
 // LLMConfig 持有 LLM 供应商设置。
 type LLMConfig struct {
-	Provider string // "openai" | "openrouter" | "anthropic"
+	Provider string // "openai" | "anthropic" | "gemini" | OpenAI-compatible provider
 	APIKey   string
 	BaseURL  string
 	Model    string
@@ -40,10 +40,11 @@ type Config struct {
 // Load 从环境变量读取配置并应用默认值。缺失值会被合理默认值替换；
 // 只有真正的配置错误（如负温度）才报错。
 func Load() (Config, error) {
+	provider := strings.ToLower(env("LLM_PROVIDER", "openai"))
 	cfg := Config{
 		LLM: LLMConfig{
-			Provider: env("LLM_PROVIDER", "openai"),
-			APIKey:   env("LLM_API_KEY", ""),
+			Provider: provider,
+			APIKey:   env("LLM_API_KEY", providerAPIKey(provider)),
 			BaseURL:  env("LLM_BASE_URL", ""),
 			Model:    env("LLM_MODEL", ""),
 		},
@@ -58,6 +59,24 @@ func Load() (Config, error) {
 		},
 	}
 	return cfg, cfg.Validate()
+}
+
+// WithLLMOverrides 返回应用命令行覆盖后的配置副本。环境变量负责提供
+// 持久默认值，而 CLI 参数仅影响当前进程，不会写回用户环境或配置文件。
+func (c Config) WithLLMOverrides(provider, apiKey, baseURL, model string) Config {
+	if strings.TrimSpace(provider) != "" {
+		c.LLM.Provider = strings.ToLower(strings.TrimSpace(provider))
+	}
+	if strings.TrimSpace(apiKey) != "" {
+		c.LLM.APIKey = strings.TrimSpace(apiKey)
+	}
+	if strings.TrimSpace(baseURL) != "" {
+		c.LLM.BaseURL = strings.TrimSpace(baseURL)
+	}
+	if strings.TrimSpace(model) != "" {
+		c.LLM.Model = strings.TrimSpace(model)
+	}
+	return c
 }
 
 // Validate 报告明显非法的配置。
@@ -94,4 +113,37 @@ func envFloat(k string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+// providerAPIKey 复用 Pi 风格的“各厂商各自环境变量 + 通用覆盖”体验。
+// LLM_API_KEY 优先级更高，故此函数只作为它缺失时的默认值。
+func providerAPIKey(provider string) string {
+	switch provider {
+	case "anthropic":
+		return env("ANTHROPIC_API_KEY", "")
+	case "gemini", "google":
+		return env("GEMINI_API_KEY", env("GOOGLE_API_KEY", ""))
+	case "openrouter":
+		return env("OPENROUTER_API_KEY", "")
+	case "groq":
+		return env("GROQ_API_KEY", "")
+	case "mistral":
+		return env("MISTRAL_API_KEY", "")
+	case "xai":
+		return env("XAI_API_KEY", "")
+	case "deepseek":
+		return env("DEEPSEEK_API_KEY", "")
+	case "cerebras":
+		return env("CEREBRAS_API_KEY", "")
+	case "zai":
+		return env("ZAI_API_KEY", "")
+	case "kimi":
+		return env("MOONSHOT_API_KEY", "")
+	case "minimax":
+		return env("MINIMAX_API_KEY", "")
+	case "ollama", "lmstudio", "vllm":
+		return ""
+	default:
+		return env("OPENAI_API_KEY", "")
+	}
 }

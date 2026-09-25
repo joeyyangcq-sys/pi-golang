@@ -33,6 +33,15 @@ func Build() (*Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("di: 加载配置: %w", err)
 	}
+	return BuildWithConfig(cfg)
+}
+
+// BuildWithConfig 用已经解析且可能被 CLI 覆盖的配置组装依赖图。
+// 它让 CLI 不需要修改全局环境变量，也方便集成测试注入固定配置。
+func BuildWithConfig(cfg Config) (*Graph, error) {
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("di: 校验配置: %w", err)
+	}
 	g := &Graph{
 		Config: cfg,
 		Prompt: prompt.Resolve(cfg.Agent.SystemPrompt),
@@ -113,24 +122,68 @@ func mergeTools(groups ...[]entity.Tool) []entity.Tool {
 	return out
 }
 
-// buildLLM 把 Config.LLM 映射到正确的 adapter.LLMProvider。
-// 当前只接通 OpenAI Chat Completions 兼容协议（OpenAI/OpenRouter）；
-// Anthropic 保持占位，避免在未实现其消息和工具协议时产生误导。
+// buildLLM 按“协议族”而不是“每个厂商一个循环”映射 provider：原生
+// Anthropic/Gemini 使用各自的消息协议，其余主流平台复用 OpenAI 兼容层。
 func buildLLM(cfg Config) adapter.LLMProvider {
 	switch cfg.LLM.Provider {
 	case "anthropic":
 		return adapter.NewAnthropic(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
+	case "gemini", "google":
+		return adapter.NewGemini(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
 	case "openrouter":
-		baseURL := cfg.LLM.BaseURL
-		if baseURL == "" {
-			baseURL = "https://openrouter.ai/api/v1"
-		}
-		return adapter.NewOpenAI(cfg.LLM.APIKey, baseURL, cfg.LLM.Model)
+		return newCompatibleProvider("openrouter", cfg, "https://openrouter.ai/api/v1", true)
+	case "groq":
+		return newCompatibleProvider("groq", cfg, "https://api.groq.com/openai/v1", true)
+	case "mistral":
+		return newCompatibleProvider("mistral", cfg, "https://api.mistral.ai/v1", true)
+	case "xai":
+		return newCompatibleProvider("xai", cfg, "https://api.x.ai/v1", true)
+	case "deepseek":
+		return newCompatibleProvider("deepseek", cfg, "https://api.deepseek.com", true)
+	case "cerebras":
+		return newCompatibleProvider("cerebras", cfg, "https://api.cerebras.ai/v1", true)
+	case "zai":
+		return newCompatibleProvider("zai", cfg, "https://open.bigmodel.cn/api/paas/v4", true)
+	case "kimi":
+		return newCompatibleProvider("kimi", cfg, "https://api.moonshot.ai/v1", true)
+	case "minimax":
+		return newCompatibleProvider("minimax", cfg, "https://api.minimax.io/v1", true)
+	case "ollama":
+		return newCompatibleProvider("ollama", cfg, "http://localhost:11434/v1", false)
+	case "lmstudio":
+		return newCompatibleProvider("lmstudio", cfg, "http://localhost:1234/v1", false)
+	case "vllm":
+		return newCompatibleProvider("vllm", cfg, "http://localhost:8000/v1", false)
 	case "openai", "":
 		return adapter.NewOpenAI(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
 	default:
-		// 未知 provider 沿用 OpenAI 兼容协议，便于接入私有网关；实际
-		// 端点由 LLM_BASE_URL 明确指定。
-		return adapter.NewOpenAI(cfg.LLM.APIKey, cfg.LLM.BaseURL, cfg.LLM.Model)
+		// custom / 私有网关。需要显式提供 LLM_BASE_URL；保留 API key 为
+		// 可选，便于无鉴权的自托管服务。
+		return newCompatibleProvider(cfg.LLM.Provider, cfg, cfg.LLM.BaseURL, false)
+	}
+}
+
+func newCompatibleProvider(name string, cfg Config, defaultBaseURL string, requireAPIKey bool) adapter.LLMProvider {
+	baseURL := cfg.LLM.BaseURL
+	if baseURL == "" {
+		baseURL = defaultBaseURL
+	}
+	return adapter.NewOpenAICompatible(
+		name,
+		cfg.LLM.APIKey,
+		baseURL,
+		cfg.LLM.Model,
+		requireAPIKey,
+		nil,
+	)
+}
+
+// SupportedProviders 返回 CLI 可展示的 provider 名称；列表只覆盖已接通
+// 的协议族，私有 OpenAI 兼容网关可用任意名称配合 LLM_BASE_URL。
+func SupportedProviders() []string {
+	return []string{
+		"anthropic", "gemini", "openai", "openrouter", "groq", "mistral",
+		"xai", "deepseek", "cerebras", "zai", "kimi", "minimax",
+		"ollama", "lmstudio", "vllm", "custom",
 	}
 }
