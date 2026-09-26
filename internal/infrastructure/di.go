@@ -2,6 +2,7 @@ package infrastructure
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 
@@ -123,13 +124,14 @@ func (g *Graph) NewAgent(_ context.Context, opts ...entity.Option) *entity.Agent
 
 	base := []entity.Option{
 		entity.WithConfig(entity.Config{
-			Name:          g.Config.Agent.Name,
-			SystemPrompt:  g.Prompt.Content,
-			Model:         g.Config.LLM.Model,
-			Temperature:   g.Config.Agent.Temperature,
-			MaxTokens:     g.Config.Agent.MaxTokens,
-			MaxIterations: g.Config.Agent.MaxIterations,
-			Timeout:       g.Config.Agent.Timeout,
+			Name:            g.Config.Agent.Name,
+			SystemPrompt:    g.Prompt.Content,
+			Model:           g.Config.LLM.Model,
+			Temperature:     g.Config.Agent.Temperature,
+			OmitTemperature: g.Config.Agent.OmitTemperature,
+			MaxTokens:       g.Config.Agent.MaxTokens,
+			MaxIterations:   g.Config.Agent.MaxIterations,
+			Timeout:         g.Config.Agent.Timeout,
 		}),
 		entity.WithLLM(g.LLM),
 		entity.WithMemory(g.Memory),
@@ -209,6 +211,13 @@ func newCompatibleProvider(name string, cfg Config, defaultBaseURL string, requi
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
+	var requestExtra map[string]any
+	if cfg.LLM.RequestExtraJSON != "" {
+		// Load validates this field. Keep direct BuildWithConfig callers safe.
+		if err := json.Unmarshal([]byte(cfg.LLM.RequestExtraJSON), &requestExtra); err != nil {
+			requestExtra = nil
+		}
+	}
 	return adapter.NewOpenAICompatibleWithOptions(
 		name,
 		cfg.LLM.APIKey,
@@ -216,7 +225,11 @@ func newCompatibleProvider(name string, cfg Config, defaultBaseURL string, requi
 		cfg.LLM.Model,
 		requireAPIKey,
 		nil,
-		adapter.OpenAICompatibleOptions{ContinueWithToolsAfterToolCall: name != "lmstudio"},
+		adapter.OpenAICompatibleOptions{
+			ContinueWithToolsAfterToolCall: name != "lmstudio",
+			MaxTokensField:                 cfg.LLM.MaxTokensField,
+			RequestExtra:                   requestExtra,
+		},
 	)
 }
 

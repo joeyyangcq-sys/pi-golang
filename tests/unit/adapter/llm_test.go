@@ -74,6 +74,50 @@ func TestOpenAIProvider_ToolContinuationPolicyIsExplicit(t *testing.T) {
 	}
 }
 
+func TestOpenAIProvider_RequestOverridesPreserveCoreFields(t *testing.T) {
+	var wire map[string]any
+	client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&wire); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{}}`)),
+		}, nil
+	})}
+	provider := adapter.NewOpenAICompatibleWithOptions(
+		"lmstudio", "", "http://example.test/v1", "model", false, client,
+		adapter.OpenAICompatibleOptions{
+			MaxTokensField: "max_completion_tokens",
+			RequestExtra: map[string]any{
+				"chat_template_kwargs": map[string]any{"enable_thinking": false},
+				"model":                "must-not-replace-model",
+			},
+		},
+	)
+	_, err := provider.Chat(context.Background(), entity.ChatRequest{
+		Model:           "model",
+		Messages:        entity.Conversation{entity.User("hello")},
+		Temperature:     0.7,
+		OmitTemperature: true,
+		MaxTokens:       1024,
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if _, exists := wire["temperature"]; exists {
+		t.Fatalf("temperature should be omitted: %#v", wire)
+	}
+	if wire["max_completion_tokens"] != float64(1024) || wire["model"] != "model" || wire["stream"] != true {
+		t.Fatalf("core wire fields = %#v", wire)
+	}
+	thinking, ok := wire["chat_template_kwargs"].(map[string]any)
+	if !ok || thinking["enable_thinking"] != false {
+		t.Fatalf("thinking override = %#v", wire["chat_template_kwargs"])
+	}
+}
+
 func TestOpenAIProvider_ChatReportsConfigurationAndHTTPFailures(t *testing.T) {
 	provider := adapter.NewOpenAI("", "https://example.invalid/v1", "test-model")
 	if _, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model"}); err == nil || !strings.Contains(err.Error(), "API key") {
@@ -484,6 +528,10 @@ type staticRoundTripper struct {
 	contentType string
 	body        string
 }
+
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
 
 func (r staticRoundTripper) RoundTrip(*http.Request) (*http.Response, error) {
 	return &http.Response{

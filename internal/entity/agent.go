@@ -41,6 +41,10 @@ type Config struct {
 	SystemPrompt string
 	Model        string
 	Temperature  float64
+	// OmitTemperature preserves the provider default instead of serializing a
+	// temperature value. It is useful for controlled comparisons where omitted
+	// and explicit sampling parameters must remain distinct.
+	OmitTemperature bool
 	// MaxTokens 为 0 表示由 provider 使用自己的默认值。
 	MaxTokens     int
 	MaxIterations int

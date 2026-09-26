@@ -1,6 +1,6 @@
 # 通用 Agent 优化方案
 
-状态：P0/P1 核心、P2 安全边界和 P3 `MaxTokens` 已实施；可选 idle timeout、temperature 未设置态和面向调用方的增量事件待后续  
+状态：P0/P1 核心、P2 安全边界和 P3 请求 profile 已实施；可选 idle timeout 和面向调用方的增量事件待后续
 范围：模型传输、工具循环、任务能力配置、请求审计与评估  
 适用任务：coding、只读检索与分析、纯文本生成，以及需要多轮工具调用的其他任务
 
@@ -19,7 +19,7 @@
 
 - [20 组 no-tools 对比](../artifacts/comparison/benchmark-20-final-no-tools/report.md)显示：成功请求的耗时主要在模型端；Go 有两个 60 秒响应头阶段超时。这个样本只覆盖单轮纯生成，不能代表 coding 或多轮 Agent 的表现。
 - 三个 HTTP adapter 现在都使用共享 SSE transport；OpenAI-compatible 仍保留普通 JSON fallback，Anthropic/Gemini 使用各自原生流事件。
-- `ChatRequest` 有 `MaxTokens`，但当前 OpenAI 请求未序列化它；temperature 始终发送，无法区分“省略”和“显式设为 0”。真实出站请求尚未与 Pi 对齐。
+- OpenAI-compatible 请求支持 `AGENT_OMIT_TEMPERATURE`、`AGENT_MAX_TOKENS`、`LLM_MAX_TOKENS_FIELD` 与受控的 `LLM_REQUEST_EXTRA_JSON`。实际等价性仍应以 wire 审计验证，不能从配置名称推断。
 - CLI 的 `auto` 工具模式已不再依赖 prompt 关键词或 `--output` 推断权限；需要纯生成能力时必须显式使用 `--tools=disabled` 和合适的 task profile。
 - [工具续轮策略](../internal/usecase/run.go)对 LM Studio 在一次工具调用后移除后续请求的 tools。需要验证其在多轮 coding 中的实际效果及适用边界。
 
@@ -82,7 +82,8 @@ Provider adapter：字段映射、HTTP/SSE 解析、超时与协议诊断
 
 ### P3：请求参数与 prompt 实验
 
-- ✅ `MaxTokens` 已从 Agent 配置（`AGENT_MAX_TOKENS`）映射到 OpenAI、Anthropic、Gemini 请求；temperature 当前仍沿用 Agent 默认值，未实现“未设置”三态。
+- ✅ `MaxTokens` 已从 Agent 配置（`AGENT_MAX_TOKENS`）映射到 OpenAI、Anthropic、Gemini 请求；OpenAI-compatible 端点可通过 `AGENT_OMIT_TEMPERATURE=true` 保留服务端默认 temperature，并可选择 `max_tokens` 或 `max_completion_tokens`。
+- ✅ `scripts/benchmark_compare.py --wire-audit` 会启动 `cmd/llm-audit-proxy`，在不缓冲 SSE 的前提下记录 Go/Pi 的脱敏真实请求，并输出 `wire-requests.jsonl` 与 `payload-diffs.jsonl`。`--request-profile` 同时生成 Pi model config 和 Go 环境变量；thinking 的具体字段由 profile 的 `thinking.extra` 显式声明，而不是绑定某个 Qwen 模板。
 - 先比较 Go 非流式与 Go 流式，其他请求字段完全一致；再分别实验 temperature、thinking、token 上限和消息模板。prompt 变化与协议变化不能同时进入同一 A/B。
 - 保持一份通用 Agent 基础行为约束；任务专属指令由调用方附加。不要为了 HTML 样本全局移除 coding 工具说明。
 
@@ -95,3 +96,25 @@ Provider adapter：字段映射、HTTP/SSE 解析、超时与协议诊断
 本机 LM Studio 实验使用固定模型与量化配置、记录缓存和预热状态、随机化配对执行顺序，并避免同时运行竞争负载。30–50 对可作为探索性复测；若要证明较小的成功率差异，应另按目标差异计算样本量。coding 正确率、工具副作用安全和任务完成率是发布门槛，不能只以平均耗时改善放行。
 
 实施顺序：**P0 → P1 → P2 → P3**。P1 与 P2 完成后再考虑把流式事件直接展示给用户；请求参数的默认值由 P3 实验决定。
+
+## 6. 首次复测命令
+
+先跑 3 对确认请求字段，再扩大到 30–50 对。默认 profile 显式发送 `temperature=0.7`、`max_completion_tokens=16384`，并省略 thinking 字段：
+
+```bash
+python3 scripts/benchmark_compare.py --runs 3 --wire-audit \
+  --output-dir artifacts/comparison/wire-parity-smoke
+```
+
+要验证本地模型的 thinking 开关，创建一个 profile，例如：
+
+```json
+{
+  "thinking": {
+    "mode": "set",
+    "extra": {"chat_template_kwargs": {"enable_thinking": false}}
+  }
+}
+```
+
+然后用 `--request-profile profile.json --wire-audit` 运行。以 `payload-diffs.jsonl` 的 `generation_fields_equal` 为准；如果 Pi 的当前版本拒绝 model `compat` 配置或字段仍不同，先根据该文件中实际字段调整 profile，再比较时延和 token。

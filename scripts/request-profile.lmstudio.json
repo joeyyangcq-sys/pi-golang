@@ -1,0 +1,15 @@
+{
+  "temperature": {
+    "mode": "set",
+    "value": 0.7
+  },
+  "max_output_tokens": {
+    "mode": "set",
+    "value": 16384,
+    "field": "max_completion_tokens"
+  },
+  "thinking": {
+    "mode": "omit"
+  },
+  "extra": {}
+}

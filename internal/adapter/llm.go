@@ -63,6 +63,8 @@ type OpenAIProvider struct {
 	BaseProvider
 	requireAPIKey          bool
 	continueWithToolsAfter bool
+	maxTokensField         string
+	requestExtra           map[string]any
 	client                 *http.Client
 }
 
@@ -105,6 +107,12 @@ func NewOpenAICompatible(
 type OpenAICompatibleOptions struct {
 	ContinueWithToolsAfterToolCall bool
 	HTTP                           StreamingHTTPConfig
+	// MaxTokensField is the endpoint's documented OpenAI-compatible budget
+	// field. Empty and max_tokens both select max_tokens.
+	MaxTokensField string
+	// RequestExtra contains documented endpoint-specific request fields, such
+	// as a thinking switch. Core protocol fields cannot be overridden.
+	RequestExtra map[string]any
 }
 
 // NewOpenAICompatibleWithOptions 构造带显式能力策略的 OpenAI-compatible
@@ -121,6 +129,13 @@ func NewOpenAICompatibleWithOptions(
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
+	maxTokensField := options.MaxTokensField
+	if maxTokensField == "" {
+		maxTokensField = "max_tokens"
+	}
+	if maxTokensField != "max_tokens" && maxTokensField != "max_completion_tokens" {
+		maxTokensField = "max_tokens"
+	}
 	return &OpenAIProvider{
 		BaseProvider: BaseProvider{
 			ProviderName:   providerName,
@@ -130,6 +145,8 @@ func NewOpenAICompatibleWithOptions(
 		},
 		requireAPIKey:          requireAPIKey,
 		continueWithToolsAfter: options.ContinueWithToolsAfterToolCall,
+		maxTokensField:         maxTokensField,
+		requestExtra:           cloneRequestExtra(options.RequestExtra),
 		client:                 newStreamingHTTPClientWithConfig(client, options.HTTP),
 	}
 }
@@ -143,17 +160,7 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req entity.ChatRequest) (enti
 	}
 	requestShape := openAIRequestShape(req)
 
-	payload, err := json.Marshal(openAIChatRequest{
-		Model:       req.Model,
-		Messages:    toOpenAIMessages(req.Messages),
-		Temperature: req.Temperature,
-		MaxTokens:   req.MaxTokens,
-		Tools:       toOpenAITools(req.Tools),
-		Stream:      true,
-		StreamOptions: &openAIStreamOptions{
-			IncludeUsage: true,
-		},
-	})
+	payload, err := json.Marshal(p.openAIRequestBody(req))
 	if err != nil {
 		return entity.ChatResponse{}, fmt.Errorf("%s: 编码请求: %w", provider, err)
 	}
@@ -203,6 +210,37 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req entity.ChatRequest) (enti
 			CacheWrite: response.Usage.PromptTokensDetails.CacheWriteTokens,
 		},
 	}, nil
+}
+
+func (p *OpenAIProvider) openAIRequestBody(req entity.ChatRequest) map[string]any {
+	body := cloneRequestExtra(p.requestExtra)
+	// Configuration extensions must not be able to replace the agent's model,
+	// conversation, tools or streaming contract.
+	for _, key := range []string{"model", "messages", "tools", "stream", "stream_options", "temperature", "max_tokens", "max_completion_tokens"} {
+		delete(body, key)
+	}
+	body["model"] = req.Model
+	body["messages"] = toOpenAIMessages(req.Messages)
+	body["stream"] = true
+	body["stream_options"] = openAIStreamOptions{IncludeUsage: true}
+	if !req.OmitTemperature {
+		body["temperature"] = req.Temperature
+	}
+	if req.MaxTokens > 0 {
+		body[p.maxTokensField] = req.MaxTokens
+	}
+	if tools := toOpenAITools(req.Tools); len(tools) > 0 {
+		body["tools"] = tools
+	}
+	return body
+}
+
+func cloneRequestExtra(extra map[string]any) map[string]any {
+	copy := make(map[string]any, len(extra)+6)
+	for key, value := range extra {
+		copy[key] = value
+	}
+	return copy
 }
 
 type openAIChatRequest struct {

@@ -345,11 +345,12 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		//    钩子可改 req；err=非致命（用原请求继续）
 		// ============================================================
 		req := entity.ChatRequest{
-			Model:       model,
-			Messages:    conv,
-			Temperature: cfg.Temperature,
-			MaxTokens:   cfg.MaxTokens,
-			Tools:       toolInfos(tools),
+			Model:           model,
+			Messages:        conv,
+			Temperature:     cfg.Temperature,
+			OmitTemperature: cfg.OmitTemperature,
+			MaxTokens:       cfg.MaxTokens,
+			Tools:           toolInfos(tools),
 		}
 		for _, p := range plugins {
 			h, ok := p.(entity.WithLLMBefore)

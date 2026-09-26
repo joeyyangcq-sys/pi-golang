@@ -15,11 +15,14 @@ import math
 import os
 import re
 import shutil
+import socket
 import statistics
 import subprocess
 import sys
 import tempfile
 import time
+import urllib.request
+import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -28,6 +31,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_MODEL = "qwen3.6-35b-a3b-heretic-splash"
 DEFAULT_BASE_URL = "http://127.0.0.1:1234/v1"
+
+DEFAULT_REQUEST_PROFILE: Dict[str, Any] = {
+    "temperature": {"mode": "set", "value": 0.7},
+    "max_output_tokens": {"mode": "set", "value": 16384, "field": "max_completion_tokens"},
+    "thinking": {"mode": "omit"},
+    "extra": {},
+}
 
 USER_PROMPT = (
     "请生成一个简单但可玩的俄罗斯方块单文件 HTML 页面。只返回完整 HTML，不要 Markdown "
@@ -63,25 +73,123 @@ def run_command(
         return 124, stdout, stderr + "\nbenchmark timeout", (time.perf_counter() - started) * 1000
 
 
-def build_go_binary(output: Path, env: Dict[str, str]) -> None:
-    command = ["go", "build", "-o", str(output), "."]
+def build_go_binary(output: Path, env: Dict[str, str], target: str = ".") -> None:
+    command = ["go", "build", "-o", str(output), target]
     code, stdout, stderr, _ = run_command(command, env, timeout=120)
     if code != 0:
         raise RuntimeError(f"go build failed ({code})\nstdout:\n{stdout}\nstderr:\n{stderr}")
 
 
-def write_pi_models_config(directory: Path, base_url: str, model: str) -> None:
+def load_request_profile(path: Optional[str]) -> Dict[str, Any]:
+    profile = json.loads(json.dumps(DEFAULT_REQUEST_PROFILE))
+    if path:
+        loaded = json.loads(Path(path).read_text(encoding="utf-8"))
+        if not isinstance(loaded, dict):
+            raise ValueError("request profile 必须是 JSON object")
+        profile.update(loaded)
+    for name in ("temperature", "max_output_tokens", "thinking"):
+        value = profile.get(name)
+        if not isinstance(value, dict) or value.get("mode") not in {"set", "omit"}:
+            raise ValueError(f"request profile.{name}.mode 必须是 set 或 omit")
+    temperature = profile["temperature"]
+    if temperature["mode"] == "set" and not isinstance(temperature.get("value"), (int, float)):
+        raise ValueError("request profile.temperature.value 必须是数字")
+    max_tokens = profile["max_output_tokens"]
+    if max_tokens["mode"] == "set":
+        if not isinstance(max_tokens.get("value"), int) or max_tokens["value"] < 1:
+            raise ValueError("request profile.max_output_tokens.value 必须是正整数")
+        if max_tokens.get("field") not in {"max_tokens", "max_completion_tokens"}:
+            raise ValueError("request profile.max_output_tokens.field 必须是 max_tokens 或 max_completion_tokens")
+    for name in ("extra",):
+        if not isinstance(profile.get(name, {}), dict):
+            raise ValueError(f"request profile.{name} 必须是 JSON object")
+    thinking = profile["thinking"]
+    if thinking["mode"] == "set" and not isinstance(thinking.get("extra"), dict):
+        raise ValueError("request profile.thinking.extra 必须是 JSON object")
+    return profile
+
+
+def request_extra(profile: Dict[str, Any]) -> Dict[str, Any]:
+    extra = dict(profile.get("extra", {}))
+    thinking = profile["thinking"]
+    if thinking["mode"] == "set":
+        extra.update(thinking["extra"])
+    return extra
+
+
+def apply_go_request_profile(env: Dict[str, str], profile: Dict[str, Any]) -> None:
+    temperature = profile["temperature"]
+    env["AGENT_OMIT_TEMPERATURE"] = "true" if temperature["mode"] == "omit" else "false"
+    if temperature["mode"] == "set":
+        env["AGENT_TEMPERATURE"] = str(temperature["value"])
+    max_tokens = profile["max_output_tokens"]
+    if max_tokens["mode"] == "set":
+        env["AGENT_MAX_TOKENS"] = str(max_tokens["value"])
+        env["LLM_MAX_TOKENS_FIELD"] = max_tokens["field"]
+    else:
+        env["AGENT_MAX_TOKENS"] = "0"
+        env.pop("LLM_MAX_TOKENS_FIELD", None)
+    extra = request_extra(profile)
+    if extra:
+        env["LLM_REQUEST_EXTRA_JSON"] = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+    else:
+        env.pop("LLM_REQUEST_EXTRA_JSON", None)
+
+
+def write_pi_models_config(directory: Path, base_url: str, model: str, profile: Dict[str, Any]) -> None:
+    temperature = profile["temperature"]
+    max_tokens = profile["max_output_tokens"]
+    sampling_params = request_extra(profile)
+    if temperature["mode"] == "set":
+        sampling_params["temperature"] = temperature["value"]
+    model_config: Dict[str, Any] = {"id": model}
+    if max_tokens["mode"] == "set":
+        model_config["maxTokens"] = max_tokens["value"]
+        model_config["compat"] = {"maxTokensField": max_tokens["field"]}
+    if sampling_params:
+        model_config["samplingParams"] = sampling_params
     config = {
         "providers": {
             "lmstudio": {
                 "baseUrl": base_url,
                 "api": "openai-completions",
                 "apiKey": "lm-studio-local",
-                "models": [{"id": model}],
+                "models": [model_config],
             }
         }
     }
     (directory / "models.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+
+
+def unused_local_address() -> str:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return f"127.0.0.1:{sock.getsockname()[1]}"
+
+
+def start_audit_proxy(binary: Path, upstream: str, audit_file: Path, log_file: Path) -> Tuple[subprocess.Popen[str], str, Any]:
+    address = unused_local_address()
+    log_stream = log_file.open("w", encoding="utf-8")
+    process = subprocess.Popen(
+        [str(binary), "--listen", address, "--upstream", upstream, "--audit-file", str(audit_file)],
+        cwd=ROOT,
+        text=True,
+        stdout=log_stream,
+        stderr=subprocess.STDOUT,
+    )
+    health_url = f"http://{address}/healthz"
+    for _ in range(50):
+        if process.poll() is not None:
+            log_stream.close()
+            raise RuntimeError(f"audit proxy exited early; see {log_file}")
+        try:
+            with urllib.request.urlopen(health_url, timeout=0.2):
+                return process, f"http://{address}", log_stream
+        except Exception:
+            time.sleep(0.1)
+    process.terminate()
+    log_stream.close()
+    raise RuntimeError(f"audit proxy did not become healthy; see {log_file}")
 
 
 def safe_json_lines(text: str) -> Iterable[Dict[str, Any]]:
@@ -386,6 +494,77 @@ def flatten_usage(record: Dict[str, Any]) -> None:
     record.setdefault("first_content_ms", 0)
 
 
+def diff_values(left: Any, right: Any, path: str = "", limit: int = 64) -> List[Dict[str, Any]]:
+    if len(path) > 512:
+        return [{"path": path, "go": "path_too_deep", "pi": "path_too_deep"}]
+    if type(left) is not type(right):
+        return [{"path": path, "go": left, "pi": right}]
+    if isinstance(left, dict):
+        changes: List[Dict[str, Any]] = []
+        for key in sorted(set(left) | set(right)):
+            if len(changes) >= limit:
+                break
+            child = f"{path}.{key}" if path else key
+            if key not in left or key not in right:
+                changes.append({"path": child, "go": left.get(key), "pi": right.get(key)})
+                continue
+            changes.extend(diff_values(left[key], right[key], child, limit - len(changes)))
+        return changes
+    if isinstance(left, list):
+        changes = []
+        for index in range(max(len(left), len(right))):
+            if len(changes) >= limit:
+                break
+            child = f"{path}[{index}]"
+            if index >= len(left) or index >= len(right):
+                changes.append({"path": child, "go": left[index] if index < len(left) else None, "pi": right[index] if index < len(right) else None})
+                continue
+            changes.extend(diff_values(left[index], right[index], child, limit - len(changes)))
+        return changes
+    return [] if left == right else [{"path": path, "go": left, "pi": right}]
+
+
+def write_payload_diffs(wire_path: Path, output_path: Path) -> Dict[str, Any]:
+    records = list(safe_json_lines(wire_path.read_text(encoding="utf-8"))) if wire_path.exists() else []
+    by_runner = {
+        runner: [record for record in records if record.get("runner") == runner]
+        for runner in ("go", "pi")
+    }
+    pairs = min(len(by_runner["go"]), len(by_runner["pi"]))
+    exact_matches = 0
+    generation_matches = 0
+    with output_path.open("w", encoding="utf-8") as stream:
+        for index in range(pairs):
+            go_record = by_runner["go"][index]
+            pi_record = by_runner["pi"][index]
+            go_semantic = go_record.get("semantic", {})
+            pi_semantic = pi_record.get("semantic", {})
+            generation_keys = ("stream", "stream_options", "temperature", "max_tokens", "max_completion_tokens", "top_p", "seed", "reasoning_effort", "thinking", "chat_template_kwargs")
+            go_generation = {key: go_semantic.get(key) for key in generation_keys if key in go_semantic}
+            pi_generation = {key: pi_semantic.get(key) for key in generation_keys if key in pi_semantic}
+            exact = go_record.get("canonical_sha256") == pi_record.get("canonical_sha256")
+            generation_equal = go_generation == pi_generation
+            exact_matches += int(exact)
+            generation_matches += int(generation_equal)
+            stream.write(json.dumps({
+                "pair": index + 1,
+                "go_sequence": go_record.get("sequence"),
+                "pi_sequence": pi_record.get("sequence"),
+                "exact_payload_equal": exact,
+                "generation_fields_equal": generation_equal,
+                "generation_diff": diff_values(go_generation, pi_generation),
+                "semantic_diff": diff_values(go_semantic, pi_semantic),
+            }, ensure_ascii=False) + "\n")
+    return {
+        "go_requests": len(by_runner["go"]),
+        "pi_requests": len(by_runner["pi"]),
+        "paired_requests": pairs,
+        "exact_payload_matches": exact_matches,
+        "generation_field_matches": generation_matches,
+        "unpaired_requests": len(by_runner["go"]) + len(by_runner["pi"]) - pairs * 2,
+    }
+
+
 def relative(go_value: float, pi_value: float) -> float:
     return round((go_value - pi_value) / pi_value * 100, 2) if pi_value else 0.0
 
@@ -454,6 +633,13 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         "| 指标（均值） | pi-golang | Pi | Go 相对 Pi |",
         "|---|---:|---:|---:|",
     ]
+    wire_summary = getattr(args, "wire_summary", None)
+    if isinstance(wire_summary, dict):
+        lines.extend([
+            f"- Wire 审计：Go `{wire_summary['go_requests']}` 个请求，Pi `{wire_summary['pi_requests']}` 个请求；"
+            f"已配对 `{wire_summary['paired_requests']}`，生成参数一致 `{wire_summary['generation_field_matches']}/{wire_summary['paired_requests']}`。",
+            "- `wire-requests.jsonl` 和 `payload-diffs.jsonl` 仅含脱敏字段、长度与 SHA-256，不写入 prompt 或 Authorization。",
+        ])
     for label, field in [("耗时 ms", "wall_ms"), ("输入 token", "input"), ("输出 token", "output"), ("总 token", "total"), ("reasoning token", "reasoning"), ("工具调用", "tool_calls")]:
         go_mean = go_summary[field]["mean"]
         pi_mean = pi_summary[field]["mean"]
@@ -540,6 +726,7 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
             "## 原始记录",
             "",
             "- `records.jsonl`：每次运行的 wall time、usage、错误和工具计数",
+            "- `request-profile.json`：本轮 Go/Pi 共同使用的请求参数配置（新基准运行时生成）",
             "- `go/`：Go Agent 的 JSONL 审计（默认脱敏）",
             "- `pi/`：Pi JSON event stream",
         ]
@@ -557,6 +744,8 @@ def main() -> int:
     parser.add_argument("--smoke", action="store_true", help="只跑每个 runner 1 次")
     parser.add_argument("--go-tools", action="store_true", help="Go Agent 也携带默认工具；默认关闭以进行纯文本公平比较")
     parser.add_argument("--pi-tools", action="store_true", help="Pi 也开启内置工具；与 --go-tools 一起使用可测试真实工具循环")
+    parser.add_argument("--request-profile", help="共享请求 profile JSON，显式对齐 temperature、token 上限和 thinking 字段")
+    parser.add_argument("--wire-audit", action="store_true", help="经本地透明代理记录 Go/Pi 脱敏 wire request 并生成 payload diff")
     parser.add_argument("--go-only", action="store_true", help="只运行 Go Agent，不启动 Pi")
     parser.add_argument("--compare-pi-records", help="go-only 模式下复用已有 records.jsonl 中的 Pi 记录作为基线")
     parser.add_argument("--report-only", help="只用已有 records.jsonl 生成报告，不调用 LLM")
@@ -567,6 +756,10 @@ def main() -> int:
         parser.error("--runs 必须 >= 1")
     if args.go_only and not args.compare_pi_records:
         parser.error("--go-only 必须同时提供 --compare-pi-records")
+    try:
+        request_profile = load_request_profile(args.request_profile)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        parser.error(f"request profile 无效: {error}")
 
     if args.report_only:
         records_path = Path(args.report_only).resolve()
@@ -642,6 +835,10 @@ def main() -> int:
 
     output_dir = (ROOT / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    (output_dir / "request-profile.json").write_text(
+        json.dumps(request_profile, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
     (output_dir / "go").mkdir(exist_ok=True)
     if not args.go_only:
         (output_dir / "pi").mkdir(exist_ok=True)
@@ -653,14 +850,33 @@ def main() -> int:
     env["LLM_MODEL"] = args.model
     env.setdefault("LM_API_TOKEN", "")
     env["GOCACHE"] = "/tmp/pi-golang-benchmark-gocache"
+    apply_go_request_profile(env, request_profile)
 
     with tempfile.TemporaryDirectory(prefix="pi-golang-benchmark-") as temp_dir:
         temp_root = Path(temp_dir)
         binary = temp_root / "pi-agent"
         build_go_binary(binary, env)
+        go_base_url = args.base_url
+        pi_base_url = args.base_url
+        audit_process: Optional[subprocess.Popen[str]] = None
+        audit_log = None
+        if args.wire_audit:
+            audit_binary = temp_root / "llm-audit-proxy"
+            build_go_binary(audit_binary, env, "./cmd/llm-audit-proxy")
+            parsed_base_url = urllib.parse.urlsplit(args.base_url)
+            upstream = urllib.parse.urlunsplit((parsed_base_url.scheme, parsed_base_url.netloc, "", "", ""))
+            base_path = parsed_base_url.path.rstrip("/")
+            audit_process, proxy_base_url, audit_log = start_audit_proxy(
+                audit_binary,
+                upstream,
+                output_dir / "wire-requests.jsonl",
+                output_dir / "audit-proxy.log",
+            )
+            go_base_url = f"{proxy_base_url}/go{base_path}"
+            pi_base_url = f"{proxy_base_url}/pi{base_path}"
         pi_agent_dir = temp_root / "pi-agent-dir"
         pi_agent_dir.mkdir()
-        write_pi_models_config(pi_agent_dir, args.base_url, args.model)
+        write_pi_models_config(pi_agent_dir, pi_base_url, args.model, request_profile)
         pi_env = dict(env)
         pi_env["PI_CODING_AGENT_DIR"] = str(pi_agent_dir)
         pi_env["PI_OFFLINE"] = "1"
@@ -696,7 +912,7 @@ def main() -> int:
                         "--provider",
                         "lmstudio",
                         "--base-url",
-                        args.base_url,
+                        go_base_url,
                         "--model",
                         args.model,
                         "--prompt",
@@ -767,6 +983,18 @@ def main() -> int:
                 with records_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(parsed, ensure_ascii=False) + "\n")
                 records.append(parsed)
+
+        if audit_process is not None:
+            audit_process.terminate()
+            try:
+                audit_process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                audit_process.kill()
+            if audit_log is not None:
+                audit_log.close()
+
+    if args.wire_audit:
+        args.wire_summary = write_payload_diffs(output_dir / "wire-requests.jsonl", output_dir / "payload-diffs.jsonl")
 
     report_path = output_dir / "report.md"
     write_report(report_path, args, records)

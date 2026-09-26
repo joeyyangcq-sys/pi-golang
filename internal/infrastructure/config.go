@@ -3,7 +3,9 @@
 package infrastructure
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"strconv"
 	"strings"
@@ -16,16 +18,24 @@ type LLMConfig struct {
 	APIKey   string
 	BaseURL  string
 	Model    string
+	// MaxTokensField selects the OpenAI-compatible output-budget field for
+	// endpoints that require max_completion_tokens instead of max_tokens.
+	MaxTokensField string
+	// RequestExtraJSON is an explicit provider-specific JSON object. It is
+	// intended for documented compatibility controls such as a thinking switch.
+	// It remains text here so LLMConfig can still be compared in callers.
+	RequestExtraJSON string
 }
 
 // AgentConfig 持有 Agent 相关配置。
 type AgentConfig struct {
-	Name          string
-	SystemPrompt  string
-	Temperature   float64
-	MaxTokens     int
-	MaxIterations int
-	Timeout       time.Duration
+	Name            string
+	SystemPrompt    string
+	Temperature     float64
+	OmitTemperature bool
+	MaxTokens       int
+	MaxIterations   int
+	Timeout         time.Duration
 }
 
 // LogConfig 控制日志器。
@@ -84,20 +94,27 @@ func Load() (Config, error) {
 	if value, ok := os.LookupEnv("LLM_MODEL"); ok {
 		model = strings.TrimSpace(value)
 	}
+	requestExtra, err := envJSONObject("LLM_REQUEST_EXTRA_JSON")
+	if err != nil {
+		return Config{}, err
+	}
 	cfg := Config{
 		LLM: LLMConfig{
-			Provider: provider,
-			APIKey:   apiKey,
-			BaseURL:  baseURL,
-			Model:    model,
+			Provider:         provider,
+			APIKey:           apiKey,
+			BaseURL:          baseURL,
+			Model:            model,
+			MaxTokensField:   env("LLM_MAX_TOKENS_FIELD", ""),
+			RequestExtraJSON: requestExtra,
 		},
 		Agent: AgentConfig{
-			Name:          env("AGENT_NAME", "pi-agent"),
-			SystemPrompt:  env("AGENT_SYSTEM_PROMPT", ""),
-			Temperature:   envFloat("AGENT_TEMPERATURE", 0.7),
-			MaxTokens:     envInt("AGENT_MAX_TOKENS", 0),
-			MaxIterations: envInt("AGENT_MAX_ITERATIONS", 5),
-			Timeout:       envDuration("AGENT_TIMEOUT", 0),
+			Name:            env("AGENT_NAME", "pi-agent"),
+			SystemPrompt:    env("AGENT_SYSTEM_PROMPT", ""),
+			Temperature:     envFloat("AGENT_TEMPERATURE", 0.7),
+			OmitTemperature: envBool("AGENT_OMIT_TEMPERATURE", false),
+			MaxTokens:       envInt("AGENT_MAX_TOKENS", 0),
+			MaxIterations:   envInt("AGENT_MAX_ITERATIONS", 5),
+			Timeout:         envDuration("AGENT_TIMEOUT", 0),
 		},
 		Log: LogConfig{
 			Level: env("LOG_LEVEL", "info"),
@@ -173,6 +190,15 @@ func (c Config) Validate() error {
 	if c.Agent.Temperature < 0 || c.Agent.Temperature > 2 {
 		return errors.New("config: AGENT_TEMPERATURE 必须在 0 到 2 之间")
 	}
+	if c.LLM.MaxTokensField != "" && c.LLM.MaxTokensField != "max_tokens" && c.LLM.MaxTokensField != "max_completion_tokens" {
+		return errors.New("config: LLM_MAX_TOKENS_FIELD 必须是 max_tokens 或 max_completion_tokens")
+	}
+	if c.LLM.RequestExtraJSON != "" {
+		var extra map[string]any
+		if err := json.Unmarshal([]byte(c.LLM.RequestExtraJSON), &extra); err != nil || extra == nil {
+			return errors.New("config: LLM_REQUEST_EXTRA_JSON 必须是 JSON object")
+		}
+	}
 	if c.Agent.MaxIterations < 1 {
 		return errors.New("config: AGENT_MAX_ITERATIONS 必须 >= 1")
 	}
@@ -211,6 +237,33 @@ func envFloat(k string, def float64) float64 {
 		}
 	}
 	return def
+}
+
+func envBool(k string, def bool) bool {
+	raw, ok := os.LookupEnv(k)
+	if !ok {
+		return def
+	}
+	value, err := strconv.ParseBool(strings.TrimSpace(raw))
+	if err != nil {
+		return def
+	}
+	return value
+}
+
+func envJSONObject(k string) (string, error) {
+	raw, ok := os.LookupEnv(k)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return "", nil
+	}
+	var value map[string]any
+	if err := json.Unmarshal([]byte(raw), &value); err != nil {
+		return "", fmt.Errorf("config: %s 必须是 JSON object: %w", k, err)
+	}
+	if value == nil {
+		return "", fmt.Errorf("config: %s 必须是 JSON object", k)
+	}
+	return strings.TrimSpace(raw), nil
 }
 
 func envDuration(k string, def time.Duration) time.Duration {

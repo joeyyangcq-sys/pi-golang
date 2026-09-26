@@ -89,11 +89,12 @@ func (e *LLMError) Unwrap() error {
 
 // ChatRequest 是 LLM.Chat 的唯一入参包。
 type ChatRequest struct {
-	Model       string
-	Messages    Conversation
-	Temperature float64
-	MaxTokens   int
-	Tools       []Info
+	Model           string
+	Messages        Conversation
+	Temperature     float64
+	OmitTemperature bool
+	MaxTokens       int
+	Tools           []Info
 }
 
 // TaskProfile describes the capability level required by a run. It is supplied

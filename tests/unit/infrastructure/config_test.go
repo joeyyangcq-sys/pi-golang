@@ -33,6 +33,19 @@ func TestLoad_ParsesAgentBudget(t *testing.T) {
 	}
 }
 
+func TestLoad_ParsesOpenAICompatibleRequestProfile(t *testing.T) {
+	t.Setenv("AGENT_OMIT_TEMPERATURE", "true")
+	t.Setenv("LLM_MAX_TOKENS_FIELD", "max_completion_tokens")
+	t.Setenv("LLM_REQUEST_EXTRA_JSON", `{"chat_template_kwargs":{"enable_thinking":false}}`)
+	cfg, err := infrastructure.Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if !cfg.Agent.OmitTemperature || cfg.LLM.MaxTokensField != "max_completion_tokens" || cfg.LLM.RequestExtraJSON == "" {
+		t.Fatalf("request profile = %+v", cfg)
+	}
+}
+
 func TestConfig_RejectsNegativeAgentBudget(t *testing.T) {
 	cfg := infrastructure.Config{Agent: infrastructure.AgentConfig{MaxTokens: -1}}
 	if err := cfg.Validate(); err == nil {
