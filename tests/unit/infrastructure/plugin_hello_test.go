@@ -49,6 +49,17 @@ func TestHelloTool_CallBadArgs_ReturnsErrorResult(t *testing.T) {
 	}
 }
 
+func TestHelloTool_CallEmptyName_ReturnsErrorResult(t *testing.T) {
+	tool := infrastructure.NewHelloPlugin(nil, nil).RegisterTools()[0]
+	res := tool.Call(context.Background(), entity.Request{
+		Name:      "hello",
+		Arguments: []byte(`{"name":"   "}`),
+	})
+	if !res.IsError {
+		t.Fatal("空 name 应返回 IsError=true")
+	}
+}
+
 func TestHelloPlugin_OnToolAfter_CountsSuccess(t *testing.T) {
 	p := infrastructure.NewHelloPlugin(nil, nil)
 	_, _ = p.OnToolAfter(context.Background(), nil, nil, entity.Request{}, entity.Result{Content: "ok"})

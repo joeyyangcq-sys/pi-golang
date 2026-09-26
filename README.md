@@ -38,17 +38,18 @@ pi-golang/
         ├── memory_inmem.go          #   内存版 Memory
         ├── eventbus_inmem.go        #   内存版 EventBus
         ├── plugin_state_inmem.go    #   内存版 PluginStateStore
-        ├── plugin_hello.go          #   示例插件（工具+钩子+事件订阅+状态）
+        ├── plugin_hello.go          #   示例插件（hello 工具+钩子+事件订阅+状态）
+        ├── plugin_workspace.go      #   工作区工具（list/read/write，路径沙盒）
         ├── logger.go                #   slog shim
         └── di.go                    #   Graph + Build + NewAgent + mergeTools
-    └── tests/
-        ├── unit/                    #   与业务实现分离的 Go 单元测试
-        │   ├── adapter/             #   LLM 协议黑盒测试（httptest）
-        │   ├── entity/              #   Agent / Conversation 行为测试
-        │   ├── infrastructure/      #   配置、插件、事件、审计 sink 测试
-        │   ├── prompt/               #   PromptArtifact 测试
-        │   └── usecase/              #   Agent 循环与 hook 行为测试
-        └── integration/             #   Python CLI 黑盒测试与 mock LLM
+└── tests/
+    ├── unit/                        #   与业务实现分离的 Go 单元测试
+    │   ├── adapter/                 #   LLM 协议黑盒测试（httptest）
+    │   ├── entity/                  #   Agent / Conversation 行为测试
+    │   ├── infrastructure/          #   配置、插件、事件、审计 sink 测试
+    │   ├── prompt/                  #   PromptArtifact 测试
+    │   └── usecase/                 #   Agent 循环与 hook 行为测试
+    └── integration/                 #   Python CLI 黑盒测试与 mock LLM
 ```
 
 依赖方向严格**由外向内**：`infrastructure → adapter/usecase → entity`。
@@ -80,6 +81,8 @@ go run . setup
 自动进入同一个配置向导。交互式终端之外不会等待输入，而是打印修复提示。
 配置文件默认使用 `os.UserConfigDir()/pi-agent/config.json`，目录权限为 0700、
 文件权限为 0600；可用 `PI_AGENT_CONFIG_FILE` 指定容器或测试中的替代路径。
+LM Studio 如果打开了 Require Authentication，可把 token 放在 `LM_API_TOKEN`
+环境变量中；向导里的本地 provider API key 也会按 0600 权限保存。
 
 ## Provider 与 CLI
 
@@ -105,7 +108,44 @@ DEEPSEEK_API_KEY='…' go run . run --provider deepseek --model '你的模型 ID
 go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' --model '已加载的模型 ID' --prompt '你好'
 go run . run --provider ollama --model '你的模型 ID' --prompt '你好'
 go run . run --provider custom --base-url 'http://localhost:8000/v1' --model '你的模型 ID' --prompt '你好'
+
+# 让 pi-golang Agent 生成 HTML，并由 Go 自动清洗、原子写入文件
+go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' \
+  --model '已加载的模型 ID' \
+  --prompt '只返回完整的单文件 HTML 页面，不要 Markdown 代码围栏。' \
+  --output ./artifacts/page.html
 ```
+
+### 本地 LM Studio 俄罗斯方块任务与用量记录
+
+推荐让 `pi-golang` Agent 自己完成任务：Go CLI 会把最终回答清洗为 HTML，原子写入
+`--output` 指定路径；标准输出同时打印耗时和 token 汇总，`--audit-file` 保存每轮
+请求/响应。下面命令的生成链路全部经过 Go Agent：
+
+```bash
+go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' \
+  --model '已加载的模型 ID' \
+  --prompt '生成一个可玩的单文件俄罗斯方块 HTML，只返回完整 HTML。' \
+  --output ./artifacts/tetris/pi-agent-tetris.html \
+  --audit-file ./artifacts/tetris/pi-agent-tetris.jsonl
+```
+
+审计默认是 `redacted`，响应正文只保存长度和 SHA-256；本地调试需要在日志中
+查看完整 HTML 时显式加 `--audit-content full`。这会把完整模型响应写入 JSONL，
+请勿把该日志提交到公共仓库。
+
+仓库仍保留一个不依赖第三方 Python 包的协议黑盒脚本，适合单独压测本地端点；它
+把耗时和 provider 返回的 token 用量写入 `artifacts/tetris/tetris.run.json`。模型
+没有返回 `usage` 时会标记 `usage_quality=missing`，不会伪造 token 数。
+
+```bash
+# LM Studio Developer > Server Settings > Manage Tokens 生成 token 后：
+export LM_API_TOKEN='粘贴到本地 shell，不要提交到仓库'
+python3 scripts/run_local_tetris.py --model '已加载的模型 ID'
+```
+
+如果 LM Studio 未开启认证，可以省略 `LM_API_TOKEN`。如果没有显式 `--model`，
+脚本会从 `/v1/models` 选择第一个已加载模型。
 
 Anthropic 与 Gemini 当前先支持文本循环；它们的原生工具/流式载荷留待
 下一阶段。不要将 OpenAI 的工具消息格式直接发送给这两个原生 API。
@@ -123,6 +163,21 @@ LOG_LEVEL=debug go run . run -prompt "hello" --debug
 # 使用环境变量覆盖内置 prompts/base.md；输出会标记为 agent.override
 AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run -prompt "你好" --debug
 ```
+
+### Agent 工具说明
+
+默认构建的 Agent 不再只有演示性质的 `hello`：还会注册工作区工具
+`list_files`、`read_file`、`write_file`。提示词会要求模型先探索、再读取、最后
+修改并验证；每个工具的描述和 JSON Schema 都会随请求发送给兼容 OpenAI 的 LLM，
+因此模型能知道参数、用途和限制。
+
+工作区根目录是启动进程时的当前目录。文件工具只接受相对路径，拒绝 `..` 越界和
+指向根目录外的符号链接；读取上限默认 128 KiB（最大 1 MiB），单次写入最大 1 MiB，
+写入使用临时文件 + `fsync` + 原子替换。当前刻意没有开放任意 shell/exec；如果后续
+需要命令工具，应增加白名单、超时、输出上限和审批策略后再接入。
+
+如需确认实际注册内容，可用 `--debug` 查看 `tools=4`，或把
+`LOG_LEVEL=debug` 打开观察每轮的工具调用、参数摘要和结果。
 
 排错顺序：先确认 `--debug` 的 model 和 prompt 元数据符合预期；再看
 `LOG_LEVEL=debug` 的 `llm 回复` 记录；最后检查返回的 HTTP 状态。缺少

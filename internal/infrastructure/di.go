@@ -3,6 +3,7 @@ package infrastructure
 import (
 	"context"
 	"fmt"
+	"os"
 
 	"pi-golang/internal/adapter"
 	"pi-golang/internal/entity"
@@ -53,7 +54,15 @@ func BuildWithConfig(cfg Config) (*Graph, error) {
 	g.Memory = NewInMemoryMemory()
 	g.EventBus = NewInMemoryEventBus()
 	g.PluginState = NewInMemoryPluginState()
-	g.Plugins = buildPlugins(g.PluginState, g.EventBus)
+	workspace, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("di: 获取工作区: %w", err)
+	}
+	plugins, err := buildPlugins(g.PluginState, g.EventBus, workspace)
+	if err != nil {
+		return nil, err
+	}
+	g.Plugins = plugins
 	audit, err := buildAudit(cfg)
 	if err != nil {
 		return nil, err
@@ -84,10 +93,15 @@ func buildAudit(cfg Config) (usecase.LLMAuditSink, error) {
 
 // buildPlugins 构造内置插件列表。新增内置插件时在此追加。
 // 顺序即钩子触发顺序；工具合并时同名工具按"最后写入胜出"。
-func buildPlugins(state entity.PluginStateStore, bus entity.EventBus) []entity.Plugin {
+func buildPlugins(state entity.PluginStateStore, bus entity.EventBus, workspace string) ([]entity.Plugin, error) {
+	workspacePlugin, err := NewWorkspacePlugin(workspace)
+	if err != nil {
+		return nil, fmt.Errorf("di: 初始化工作区工具: %w", err)
+	}
 	return []entity.Plugin{
 		NewHelloPlugin(state, bus),
-	}
+		workspacePlugin,
+	}, nil
 }
 
 // NewAgent 从 Graph 产出一个完整配置的 *entity.Agent。

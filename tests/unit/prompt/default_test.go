@@ -1,6 +1,7 @@
 package prompt_test
 
 import (
+	"strings"
 	"testing"
 
 	"pi-golang/internal/prompt"
@@ -16,6 +17,21 @@ func TestDefault_IsStableAndIdentified(t *testing.T) {
 	}
 	if again := prompt.Default(); again != artifact {
 		t.Fatalf("同一内置提示词应产生稳定快照: got %+v, want %+v", again, artifact)
+	}
+}
+
+func TestDefault_DescribesAgentWorkflowAndTools(t *testing.T) {
+	content := prompt.Default().Content
+	for _, want := range []string{
+		"list_files",
+		"read_file",
+		"write_file",
+		"Working loop",
+		"Do not claim",
+	} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("默认提示词缺少 %q: %s", want, content)
+		}
 	}
 }
 

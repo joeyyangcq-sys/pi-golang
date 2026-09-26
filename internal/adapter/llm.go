@@ -64,7 +64,7 @@ func doJSON(ctx context.Context, client *http.Client, request *http.Request, pro
 	if err != nil {
 		return nil, fmt.Errorf("%s: 请求失败: %w", provider, err)
 	}
-	defer response.Body.Close()
+	defer func() { _ = response.Body.Close() }()
 
 	body, err := io.ReadAll(io.LimitReader(response.Body, 1<<20))
 	if err != nil {

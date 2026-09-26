@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"pi-golang/internal/entity"
@@ -101,9 +102,17 @@ type helloTool struct{}
 
 func (helloTool) Info() entity.Info {
 	return entity.Info{
-		Name:        "hello",
-		Description: "按名字打招呼。当用户想要友好问候时使用。",
-		InputSchema: json.RawMessage(`{"type":"object","properties":{"name":{"type":"string"}}}`),
+		Name: "hello",
+		Description: "生成一条简短、友好的问候语。仅在用户明确要求打招呼或进行友好问候时使用；" +
+			"不要用它代替文件读取、写入或任务执行。name 应是用户提供的称呼，不要猜测或拼接敏感信息。",
+		InputSchema: json.RawMessage(`{
+  "type":"object",
+  "properties":{
+    "name":{"type":"string","description":"要问候的称呼，例如 Joey；不能为空"}
+  },
+  "required":["name"],
+  "additionalProperties":false
+}`),
 	}
 }
 
@@ -118,7 +127,11 @@ func (helloTool) Call(ctx context.Context, r entity.Request) entity.Result {
 	if err := entity.DecodeArguments(r, &args); err != nil {
 		return entity.Result{Content: fmt.Sprintf("参数解析失败: %v", err), IsError: true}
 	}
-	msg := "Hello, " + args.Name + "!"
+	name := strings.TrimSpace(args.Name)
+	if name == "" {
+		return entity.Result{Content: "参数错误: name 不能为空", IsError: true}
+	}
+	msg := "Hello, " + name + "!"
 	select {
 	case <-ctx.Done():
 		return entity.Result{Content: ctx.Err().Error(), IsError: true}

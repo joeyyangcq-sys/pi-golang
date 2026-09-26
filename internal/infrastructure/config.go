@@ -228,7 +228,9 @@ func providerAPIKey(provider string) string {
 		return env("MOONSHOT_API_KEY", "")
 	case "minimax":
 		return env("MINIMAX_API_KEY", "")
-	case "ollama", "lmstudio", "vllm":
+	case "lmstudio":
+		return env("LM_API_TOKEN", "")
+	case "ollama", "vllm":
 		return ""
 	default:
 		return env("OPENAI_API_KEY", "")

@@ -237,6 +237,11 @@ func (HelloTool) Call(ctx context.Context, r entity.Request) entity.Result {
 
 参考 [infrastructure/plugin_hello.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/infrastructure/plugin_hello.go)：实现 `Plugin` 基础接口 + 按需实现钩子接口 + 可在构造时 `bus.Subscribe`。然后在 [di.go buildPlugins](file:///Users/a1/develop/pi-golang/pi-golang/internal/infrastructure/di.go) 追加即可。插件自带工具会经 `mergeTools` 合并进 Agent（同名最后写入胜出）。
 
+默认的 [plugin_workspace.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/infrastructure/plugin_workspace.go)
+提供 `list_files`、`read_file`、`write_file` 三个 coding-agent 工具。它们只接受启动
+目录下的相对路径，拒绝 `..` 越界和工作区外符号链接，并限制读写大小；不要直接把
+`os/exec` 暴露给模型，命令工具需要额外的白名单、超时、输出上限和审批设计。
+
 ### 7.3 新增 LLM Provider
 
 在 [adapter/llm.go](file:///Users/a1/develop/pi-golang/pi-golang/internal/adapter/llm.go) 新建 provider，在 [di.go buildLLM](file:///Users/a1/develop/pi-golang/pi-golang/internal/infrastructure/di.go) 的 switch 加 case。
@@ -297,7 +302,8 @@ internal/
     ├── memory_inmem.go       进程内 Memory 实现
     ├── eventbus_inmem.go     进程内 EventBus 实现
     ├── plugin_state_inmem.go 进程内 PluginStateStore 实现
-    ├── plugin_hello.go       示例插件（工具+钩子+事件订阅+状态）
+    ├── plugin_hello.go       示例插件（hello 工具+钩子+事件订阅+状态）
+    ├── plugin_workspace.go   工作区工具（list/read/write + 路径沙盒）
     ├── logger.go             slog shim
     └── di.go                 Graph + Build + NewAgent + mergeTools
 ```

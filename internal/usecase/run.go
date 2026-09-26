@@ -72,6 +72,11 @@ type RunOutput struct {
 	Iterations int
 	// Elapsed 是 usecase 内的墙钟耗时。
 	Elapsed time.Duration
+	// Usage 是本次运行所有模型轮次的 token 汇总。Total 在 provider 没有直接
+	// 返回时按 Input+Output 计算；调用方仍应结合 UsageReported 判断可信度。
+	Usage entity.TokenUsage
+	// UsageReported 表示至少一轮 provider 返回了非零 token usage。
+	UsageReported bool
 }
 
 // RunUsecase 封装“运行 Agent 一次”用例的依赖。
@@ -366,8 +371,20 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: lerr})
 			return out, fmt.Errorf("usecase: 第 %d 轮: llm: %w", i+1, lerr)
 		}
+		out.Usage.Input += resp.Usage.Input
+		out.Usage.Output += resp.Usage.Output
+		if resp.Usage.Total > 0 {
+			out.Usage.Total += resp.Usage.Total
+		} else {
+			out.Usage.Total += resp.Usage.Input + resp.Usage.Output
+		}
+		if resp.Usage.Input > 0 || resp.Usage.Output > 0 || resp.Usage.Total > 0 {
+			out.UsageReported = true
+		}
 		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
-			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content))
+			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content),
+			"input_tokens", resp.Usage.Input, "output_tokens", resp.Usage.Output,
+			"total_tokens", resp.Usage.Total)
 		// 此处记录的是 provider 的原始输出；LLMAfter Hook 可能继续改写
 		// resp，但不能覆盖模型真正返回的审计证据。
 		uc.writeAudit(ctx, LLMAuditRecord{

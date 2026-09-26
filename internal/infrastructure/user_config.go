@@ -92,7 +92,7 @@ func SaveLLMConfig(llm LLMConfig) error {
 		return fmt.Errorf("config: 创建临时文件: %w", err)
 	}
 	tmpPath := tmp.Name()
-	defer os.Remove(tmpPath)
+	defer func() { _ = os.Remove(tmpPath) }()
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("config: 设置权限: %w", err)

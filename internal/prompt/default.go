@@ -16,7 +16,7 @@ const (
 	// DefaultID 和 DefaultVersion 是默认提示词的稳定标识。修改 base.md
 	// 时请同时递增版本，方便在日志和执行记录中定位行为变化。
 	DefaultID      = "agent.base"
-	DefaultVersion = "1"
+	DefaultVersion = "2"
 )
 
 //go:embed base.md

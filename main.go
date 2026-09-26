@@ -64,6 +64,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	var model string
 	var auditFile string
 	var auditContent string
+	var outputFile string
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
@@ -72,6 +73,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	fs.StringVar(&model, "model", "", "本次使用的模型，覆盖 LLM_MODEL")
 	fs.StringVar(&auditFile, "audit-file", "", "JSONL 审计文件路径，记录每轮 LLM 输入输出")
 	fs.StringVar(&auditContent, "audit-content", "", "审计内容模式：redacted（默认）或 full")
+	fs.StringVar(&outputFile, "output", "", "把最终回答作为 HTML 原子写入文件")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -115,6 +117,11 @@ func cmdRun(ctx context.Context, args []string) int {
 			g.Prompt.ID, g.Prompt.Version, g.Prompt.Hash, len(g.Prompt.Content))
 		fmt.Fprintf(os.Stderr, "debug: model=%q provider=%q base_url=%q max_iterations=%d tools=%d\n",
 			agent.Config().Model, g.Config.LLM.Provider, g.Config.LLM.BaseURL, agent.Config().MaxIterations, len(agent.Tools()))
+		for _, tool := range agent.Tools() {
+			info := tool.Info()
+			_, _ = fmt.Fprintf(os.Stderr, "debug: tool name=%q description=%q schema=%s\n",
+				info.Name, info.Description, string(info.InputSchema))
+		}
 		fmt.Fprintln(os.Stderr, "debug: system prompt follows")
 		fmt.Fprintln(os.Stderr, g.Prompt.Content)
 	}
@@ -131,8 +138,23 @@ func cmdRun(ctx context.Context, args []string) int {
 
 	_, _ = fmt.Fprintln(os.Stdout, "===============")
 	_, _ = fmt.Fprintln(os.Stdout, "iterations:", out.Iterations, " elapsed:", out.Elapsed.Round(out.Elapsed.Truncate(1).Truncate(100)))
+	usageQuality := "missing"
+	if out.UsageReported {
+		usageQuality = "reported"
+	}
+	_, _ = fmt.Fprintln(os.Stdout, "usage:", "input", out.Usage.Input,
+		"output", out.Usage.Output, "total", out.Usage.Total, "quality", usageQuality)
 	_, _ = fmt.Fprintln(os.Stdout, "answer:")
 	_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
+	if strings.TrimSpace(outputFile) != "" {
+		if err := infrastructure.SaveHTMLArtifact(outputFile, out.FinalAnswer); err != nil {
+			g.Logger.Error(ctx, "保存 HTML 失败", "path", outputFile, "err", err)
+			_, _ = fmt.Fprintln(os.Stdout, "html save failed:", err)
+			return 1
+		}
+		g.Logger.Info(ctx, "已保存 HTML", "path", outputFile, "chars", len(out.FinalAnswer))
+		_, _ = fmt.Fprintln(os.Stdout, "html:", outputFile)
+	}
 	return 0
 }
 
@@ -168,9 +190,9 @@ func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.
 		return cfg, err
 	}
 
-	fmt.Fprintln(output, "未检测到完整的 LLM 配置，开始首次设置。")
-	fmt.Fprintf(output, "配置将保存到：%s\n", path)
-	fmt.Fprintln(output, "常用 provider：lmstudio、ollama、vllm、openai、anthropic、gemini、custom")
+	_, _ = fmt.Fprintln(output, "未检测到完整的 LLM 配置，开始首次设置。")
+	_, _ = fmt.Fprintf(output, "配置将保存到：%s\n", path)
+	_, _ = fmt.Fprintln(output, "常用 provider：lmstudio、ollama、vllm、openai、anthropic、gemini、custom")
 
 	previousProvider := strings.ToLower(strings.TrimSpace(cfg.LLM.Provider))
 	provider, err := promptLine(reader, output, "Provider", cfg.LLM.Provider)
@@ -206,21 +228,19 @@ func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.
 	}
 
 	apiKey := cfg.LLM.APIKey
+	keyLabel := "API key（可选；LM Studio 开启鉴权时填写）"
 	if providerNeedsAPIKey(provider) {
-		enteredKey, readErr := promptSecretLine(reader, output, "API key（输入时不回显）", apiKey != "")
-		if readErr != nil {
-			return cfg, readErr
-		}
-		if enteredKey != "" {
-			apiKey = enteredKey
-		}
-		if apiKey == "" {
-			return cfg, fmt.Errorf("%s provider 需要 API key", provider)
-		}
-	} else {
-		// 本地服务通常无鉴权。切换 provider 时清掉旧云端 key，避免意外
-		// 通过 Authorization header 发送给本地网关。
-		apiKey = ""
+		keyLabel = "API key（输入时不回显）"
+	}
+	enteredKey, readErr := promptSecretLine(reader, output, keyLabel, apiKey != "")
+	if readErr != nil {
+		return cfg, readErr
+	}
+	if enteredKey != "" {
+		apiKey = enteredKey
+	}
+	if providerNeedsAPIKey(provider) && apiKey == "" {
+		return cfg, fmt.Errorf("%s provider 需要 API key", provider)
 	}
 
 	cfg.LLM = infrastructure.LLMConfig{
@@ -232,15 +252,15 @@ func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.
 	if err := infrastructure.SaveLLMConfig(cfg.LLM); err != nil {
 		return cfg, err
 	}
-	fmt.Fprintln(output, "LLM 配置已保存。下次可直接运行 `go run .`。")
+	_, _ = fmt.Fprintln(output, "LLM 配置已保存。下次可直接运行 `go run .`。")
 	return cfg, nil
 }
 
 func promptLine(reader *bufio.Reader, output io.Writer, label, defaultValue string) (string, error) {
 	if defaultValue != "" {
-		fmt.Fprintf(output, "%s [%s]: ", label, defaultValue)
+		_, _ = fmt.Fprintf(output, "%s [%s]: ", label, defaultValue)
 	} else {
-		fmt.Fprintf(output, "%s: ", label)
+		_, _ = fmt.Fprintf(output, "%s: ", label)
 	}
 	line, err := reader.ReadString('\n')
 	if err != nil && len(line) == 0 {
@@ -255,16 +275,20 @@ func promptLine(reader *bufio.Reader, output io.Writer, label, defaultValue stri
 
 func promptSecretLine(reader *bufio.Reader, output io.Writer, label string, hasExisting bool) (string, error) {
 	if hasExisting {
-		fmt.Fprintf(output, "%s [已保存，回车保留]: ", label)
+		_, _ = fmt.Fprintf(output, "%s [已保存，回车保留]: ", label)
 	} else {
-		fmt.Fprintf(output, "%s: ", label)
+		_, _ = fmt.Fprintf(output, "%s: ", label)
 	}
 	if isInteractive(os.Stdin) {
 		// 直接传参数，不经过 shell；stty 只负责当前终端的回显开关。
-		if err := exec.Command("stty", "-echo").Run(); err == nil {
+		echoOff := exec.Command("stty", "-echo")
+		echoOff.Stdin = os.Stdin
+		if err := echoOff.Run(); err == nil {
 			defer func() {
-				_ = exec.Command("stty", "echo").Run()
-				fmt.Fprintln(output)
+				echoOn := exec.Command("stty", "echo")
+				echoOn.Stdin = os.Stdin
+				_ = echoOn.Run()
+				_, _ = fmt.Fprintln(output)
 			}()
 		}
 	}
@@ -341,6 +365,7 @@ Usage:
   LLM_API_KEY          所选 provider 的 API key           (默认: 空)
   LLM_BASE_URL         覆盖端点 base URL                  (默认: provider 默认)
   LLM_MODEL            使用的模型 id                       (默认: provider 默认)
+  LM_API_TOKEN         LM Studio 开启认证时的 API token
   AGENT_NAME           agent 名称                         (默认: pi-agent)
   AGENT_SYSTEM_PROMPT  最先注入的系统提示                   (默认: 空)
   AGENT_TEMPERATURE    0..2 采样温度                        (默认: 0.7)
@@ -360,5 +385,6 @@ Usage:
 run flags:
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
   --audit-file, --audit-content               仅覆盖本次运行的审计配置。
+  --output path                                将最终回答清洗后保存为 HTML 文件。
   API key 优先级：--api-key > LLM_API_KEY > provider 专属环境变量。
 `

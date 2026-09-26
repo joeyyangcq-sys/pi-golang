@@ -55,7 +55,7 @@ func TestFileAuditSink_FullContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewFileAuditSink() error = %v", err)
 	}
-	defer sink.Close()
+	defer func() { _ = sink.Close() }()
 	if err := sink.WriteLLM(context.Background(), usecase.LLMAuditRecord{
 		RunID: "run-2",
 		Request: entity.ChatRequest{Messages: entity.Conversation{

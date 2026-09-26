@@ -294,7 +294,7 @@ func findToolReply(msgs []entity.Message) string {
 
 func TestExecute_HappyPath_NoTools(t *testing.T) {
 	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{
-		{Content: "hello back"},
+		{Content: "hello back", Usage: entity.TokenUsage{Input: 11, Output: 7, Total: 18}},
 	}}
 	uc := usecase.NewRunUsecase(nil)
 	out, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{UserPrompt: "hi"})
@@ -306,6 +306,9 @@ func TestExecute_HappyPath_NoTools(t *testing.T) {
 	}
 	if out.Iterations != 1 {
 		t.Fatalf("迭代次数应为 1, 得到 %d", out.Iterations)
+	}
+	if out.Usage != (entity.TokenUsage{Input: 11, Output: 7, Total: 18}) || !out.UsageReported {
+		t.Fatalf("token 用量错误: %+v, reported=%v", out.Usage, out.UsageReported)
 	}
 }
 
