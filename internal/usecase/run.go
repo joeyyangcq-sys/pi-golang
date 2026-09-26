@@ -31,6 +31,7 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -58,6 +59,14 @@ type Logger interface {
 type RunInput struct {
 	// UserPrompt 是用户刚输入的文本。
 	UserPrompt string
+	// TaskProfile is selected by the caller, not inferred from model output. It
+	// controls whether an invalid tool call may use the safe clean fallback.
+	TaskProfile entity.TaskProfile
+	// ToolsMode captures the caller's resolved policy (auto/enabled/disabled)
+	// for audits. The actual tool set remains the source of truth.
+	ToolsMode string
+	// PromptVersion correlates runs with a versioned system prompt artifact.
+	PromptVersion string
 }
 
 // RunOutput 是一次 Agent 运行的结果。
@@ -271,6 +280,22 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		model = defaultModelOf(a.LLM())
 	}
 	tools := a.Tools()
+	auditMeta := runAuditMetadata{
+		PromptVersion: in.PromptVersion,
+		TaskProfile:   string(in.TaskProfile),
+		ToolsMode:     in.ToolsMode,
+	}
+	if auditMeta.TaskProfile == "" {
+		auditMeta.TaskProfile = string(entity.TaskProfileAgentMutation)
+	}
+	if auditMeta.ToolsMode == "" {
+		if len(tools) == 0 {
+			auditMeta.ToolsMode = "disabled"
+		} else {
+			auditMeta.ToolsMode = "enabled"
+		}
+	}
+	cleanToolFallbackUsed := false
 
 	for i := 0; i < cfg.MaxIterations; i++ {
 		out.Iterations = i + 1
@@ -323,6 +348,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			Model:       model,
 			Messages:    conv,
 			Temperature: cfg.Temperature,
+			MaxTokens:   cfg.MaxTokens,
 			Tools:       toolInfos(tools),
 		}
 		for _, p := range plugins {
@@ -340,6 +366,15 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			}
 			req = modified
 		}
+		if len(req.Tools) == 0 {
+			switch {
+			case cleanToolFallbackUsed:
+				auditMeta.ToolsMode = "fallback_disabled"
+			case auditMeta.ToolsMode == "enabled":
+				auditMeta.ToolsMode = "continuation_disabled"
+			}
+		}
+		auditMeta.ToolsetHash = toolsetFingerprint(req.Tools)
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMBefore, Payload: req})
 
 		// ============================================================
@@ -347,25 +382,36 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		// response 在拿到 provider 原始响应后立即写入；因此即使后面的
 		// LLMAfter Hook 改写响应，审计仍保留真实 provider 输出。
 		// ============================================================
-		uc.writeAudit(ctx, LLMAuditRecord{
+		uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
 			RunID:      runID,
 			Iteration:  i + 1,
 			Phase:      "request",
 			OccurredAt: time.Now().UTC(),
 			Model:      req.Model,
 			Request:    req,
-		})
+		}))
 		resp, lerr := a.LLM().Chat(ctx, req)
 		if lerr != nil {
-			uc.writeAudit(ctx, LLMAuditRecord{
-				RunID:      runID,
-				Iteration:  i + 1,
-				Phase:      "error",
-				OccurredAt: time.Now().UTC(),
-				Model:      req.Model,
-				Request:    req,
-				Error:      lerr.Error(),
-			})
+			failure, errorClass := llmFailureMetadata(lerr)
+			uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
+				RunID:          runID,
+				Iteration:      i + 1,
+				Phase:          "error",
+				OccurredAt:     time.Now().UTC(),
+				Model:          req.Model,
+				Provider:       failure.Provider,
+				ElapsedMS:      failure.Duration.Milliseconds(),
+				FirstByteMS:    failure.TimeToFirstByte.Milliseconds(),
+				FirstEventMS:   failure.TimeToFirstEvent.Milliseconds(),
+				FirstContentMS: failure.TimeToFirstContent.Milliseconds(),
+				Attempts:       failure.Attempts,
+				HTTPStatus:     failure.HTTPStatus,
+				ErrorClass:     string(errorClass),
+				TimeoutPhase:   failure.TimeoutPhase,
+				Request:        req,
+				RequestShape:   failure.RequestShape,
+				Error:          lerr.Error(),
+			}))
 			a.SetState(entity.AgentError)
 			uc.publishError(bus, ctx, "llm.chat", lerr)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: lerr})
@@ -373,6 +419,9 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		}
 		out.Usage.Input += resp.Usage.Input
 		out.Usage.Output += resp.Usage.Output
+		out.Usage.Reasoning += resp.Usage.Reasoning
+		out.Usage.CacheRead += resp.Usage.CacheRead
+		out.Usage.CacheWrite += resp.Usage.CacheWrite
 		if resp.Usage.Total > 0 {
 			out.Usage.Total += resp.Usage.Total
 		} else {
@@ -384,18 +433,27 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
 			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content),
 			"input_tokens", resp.Usage.Input, "output_tokens", resp.Usage.Output,
-			"total_tokens", resp.Usage.Total)
+			"reasoning_tokens", resp.Usage.Reasoning, "cache_read_tokens", resp.Usage.CacheRead,
+			"cache_write_tokens", resp.Usage.CacheWrite, "total_tokens", resp.Usage.Total)
 		// 此处记录的是 provider 的原始输出；LLMAfter Hook 可能继续改写
 		// resp，但不能覆盖模型真正返回的审计证据。
-		uc.writeAudit(ctx, LLMAuditRecord{
-			RunID:      runID,
-			Iteration:  i + 1,
-			Phase:      "response",
-			OccurredAt: time.Now().UTC(),
-			Model:      req.Model,
-			Request:    req,
-			Response:   resp,
-		})
+		uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
+			RunID:          runID,
+			Iteration:      i + 1,
+			Phase:          "response",
+			OccurredAt:     time.Now().UTC(),
+			Model:          req.Model,
+			Provider:       resp.Metadata.Provider,
+			ElapsedMS:      resp.Metadata.Duration.Milliseconds(),
+			FirstByteMS:    resp.Metadata.TimeToFirstByte.Milliseconds(),
+			FirstEventMS:   resp.Metadata.TimeToFirstEvent.Milliseconds(),
+			FirstContentMS: resp.Metadata.TimeToFirstContent.Milliseconds(),
+			Attempts:       resp.Metadata.Attempts,
+			HTTPStatus:     resp.Metadata.HTTPStatus,
+			Request:        req,
+			Response:       resp,
+			RequestShape:   resp.Metadata.RequestShape,
+		}))
 
 		// ============================================================
 		// ⑧ LLMAfter — LLM.Chat 成功返回后
@@ -448,6 +506,42 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			return out, nil
 		}
 
+		// A parsed tool_calls envelope is not proof that the arguments are safe
+		// to execute. Validate the whole batch before adding any assistant/tool
+		// history so an invalid call can never poison an LM Studio continuation.
+		inspection, validationErr := validateToolCallBatch(tools, resp.ToolCalls)
+		if validationErr != nil {
+			protocol := toToolProtocolAudit(resp.ToolCalls[0], inspection)
+			uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
+				RunID:            runID,
+				Iteration:        i + 1,
+				Phase:            "tool_validation",
+				OccurredAt:       time.Now().UTC(),
+				Model:            req.Model,
+				Provider:         resp.Metadata.Provider,
+				ToolProtocol:     protocol,
+				RecoveryStrategy: invalidToolCallRecovery(in.TaskProfile, cleanToolFallbackUsed),
+				ErrorClass:       string(inspection.Reason),
+				Error:            validationErr.Error(),
+			}))
+			uc.publishError(bus, ctx, "tool.validation", validationErr)
+
+			if in.TaskProfile.AllowsCleanToolFallback() && !cleanToolFallbackUsed {
+				// No tool has run and the malformed assistant message was never
+				// appended. The next iteration is therefore a clean, tool-free
+				// request rather than a retry of a potentially unsafe action.
+				cleanToolFallbackUsed = true
+				tools = nil
+				uc.Logger.Warn(ctx, "工具调用参数无效，降级为干净 no-tools 请求",
+					"reason", inspection.Reason, "tool", resp.ToolCalls[0].Name)
+				continue
+			}
+
+			a.SetState(entity.AgentError)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: validationErr})
+			return out, fmt.Errorf("usecase: 第 %d 轮: 无效工具调用: %w", i+1, validationErr)
+		}
+
 		a.SetState(entity.AgentActing)
 		// 保留 ToolCalls（尤其是 ID）：OpenAI 兼容 provider 下一轮必须把
 		// 这条 assistant 消息与对应 tool reply 一起发送回服务端。
@@ -461,7 +555,28 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		// 工具执行结果的关键。
 		// ============================================================
 		for _, tc := range resp.ToolCalls {
+			// `tool_dispatch` is deliberately separate from the model response:
+			// a syntactically parsed tool call is not necessarily safe enough to
+			// execute. This event is emitted only after the batch validation above.
+			uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
+				RunID:      runID,
+				Iteration:  i + 1,
+				Phase:      "tool_dispatch",
+				OccurredAt: time.Now().UTC(),
+				Model:      req.Model,
+				Provider:   resp.Metadata.Provider,
+				ToolProtocol: toToolProtocolAudit(tc, entity.ToolCallInspection{
+					ArgumentsBytes:       len(tc.Arguments),
+					ArgumentsJSONValid:   true,
+					ArgumentsSchemaValid: true,
+				}),
+			}))
 			conv = uc.dispatchTool(ctx, a, plugins, bus, tools, tc, conv)
+		}
+		if !continueWithToolsAfterToolCall(a.LLM()) {
+			// LM Studio documented tool loop: retain the tool exchange in
+			// history, then omit tools so its continuation produces text.
+			tools = nil
 		}
 
 		a.SetState(entity.AgentThinking)
@@ -828,6 +943,91 @@ func (uc *RunUsecase) writeAudit(ctx context.Context, record LLMAuditRecord) {
 	}
 }
 
+const maxToolCallArgumentsBytes = 1 << 20
+
+type runAuditMetadata struct {
+	PromptVersion string
+	TaskProfile   string
+	ToolsMode     string
+	ToolsetHash   string
+}
+
+func (m runAuditMetadata) apply(record LLMAuditRecord) LLMAuditRecord {
+	record.PromptVersion = m.PromptVersion
+	record.TaskProfile = m.TaskProfile
+	record.ToolsMode = m.ToolsMode
+	record.ToolsetHash = m.ToolsetHash
+	return record
+}
+
+// validateToolCallBatch validates every call before any side effect begins. A
+// batch is intentionally atomic: executing an earlier write before discovering
+// that a later call is malformed would make a safe fallback impossible.
+func validateToolCallBatch(tools []entity.Tool, calls []entity.ToolCall) (entity.ToolCallInspection, error) {
+	if len(tools) == 0 {
+		return entity.ToolCallInspection{Reason: entity.ToolCallToolsUnavailable}, &entity.ToolCallValidationError{
+			Reason: entity.ToolCallToolsUnavailable,
+			Err:    errors.New("当前请求未提供可调用工具"),
+		}
+	}
+	for _, call := range calls {
+		inspection, err := entity.InspectToolCall(call, maxToolCallArgumentsBytes)
+		if err != nil {
+			return inspection, err
+		}
+		// ToolLookup plugins may intentionally map an alias to a registered
+		// tool. Validate direct registrations here and let that controlled
+		// routing path retain its established behavior for aliases.
+		if tool := findToolByName(tools, call.Name); tool != nil {
+			if err := entity.ValidateToolCallSchema(call.Arguments, tool.Info().InputSchema); err != nil {
+				inspection.ArgumentsSchemaValid = false
+				var validationErr *entity.ToolCallValidationError
+				if errors.As(err, &validationErr) && validationErr != nil {
+					inspection.Reason = validationErr.Reason
+				} else {
+					inspection.Reason = entity.ToolCallSchemaMismatch
+				}
+				return inspection, err
+			}
+		}
+	}
+	return entity.ToolCallInspection{ArgumentsJSONValid: true, ArgumentsSchemaValid: true}, nil
+}
+
+func toToolProtocolAudit(call entity.ToolCall, inspection entity.ToolCallInspection) ToolProtocolAudit {
+	callIDHash := sha256.Sum256([]byte(call.ID))
+	return ToolProtocolAudit{
+		ToolName:             call.Name,
+		ToolCallIDHash:       fmt.Sprintf("%x", callIDHash[:]),
+		ArgumentsBytes:       inspection.ArgumentsBytes,
+		ArgumentsJSONValid:   inspection.ArgumentsJSONValid,
+		ArgumentsSchemaValid: inspection.ArgumentsSchemaValid,
+		ValidationReason:     string(inspection.Reason),
+	}
+}
+
+func invalidToolCallRecovery(profile entity.TaskProfile, alreadyUsed bool) string {
+	if !profile.AllowsCleanToolFallback() {
+		return "fail_safe"
+	}
+	if alreadyUsed {
+		return "fail_after_clean_no_tools"
+	}
+	return "clean_no_tools"
+}
+
+func toolsetFingerprint(infos []entity.Info) string {
+	if len(infos) == 0 {
+		return "none"
+	}
+	encoded, err := json.Marshal(infos)
+	if err != nil {
+		return "invalid"
+	}
+	sum := sha256.Sum256(encoded)
+	return fmt.Sprintf("%x", sum[:])
+}
+
 // defaultModelOf 探测 entity.LLM 是否实现可选的 DefaultModel() 方法。
 //
 // entity.LLM 只要求 Chat，避免把 provider 配置细节强加给领域层。Adapter
@@ -841,6 +1041,19 @@ func defaultModelOf(l entity.LLM) string {
 		return dm.DefaultModel()
 	}
 	return ""
+}
+
+func continueWithToolsAfterToolCall(l entity.LLM) bool {
+	policy, ok := l.(entity.ToolContinuationPolicy)
+	return !ok || policy.ContinueWithToolsAfterToolCall()
+}
+
+func llmFailureMetadata(err error) (entity.LLMCallMetadata, entity.LLMErrorClass) {
+	var llmErr *entity.LLMError
+	if errors.As(err, &llmErr) && llmErr != nil {
+		return llmErr.Metadata, llmErr.Class
+	}
+	return entity.LLMCallMetadata{}, entity.LLMErrorConfiguration
 }
 
 // toolInfos 按序提取每个工具的 Info()，生成发送给 LLM 的工具 schema 摘要。

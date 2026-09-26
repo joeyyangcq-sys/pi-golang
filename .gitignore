@@ -1,0 +1,47 @@
+# Generated agent output, benchmark results, and audit logs.
+# These files are useful locally, but are reproducible and can contain prompts,
+# model responses, or other data that should not be committed accidentally.
+/artifacts/
+var/
+logs/
+*.log
+*.trace
+*.prof
+*.pprof
+*.run.json
+*.audit.jsonl
+
+# Go build and test output.
+/bin/
+/dist/
+/coverage/
+coverage.out
+*.test
+*.coverprofile
+*.out
+
+# Python caches, virtual environments, and test tooling output.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local configuration and credentials.
+.env
+.env.*
+!.env.example
+*.local.json
+*.local.yaml
+*.local.yml
+
+# Local Docker/database state.
+docker-data/
+postgres-data/
+
+# Editor and operating-system metadata.
+.DS_Store
+.idea/
+.vscode/

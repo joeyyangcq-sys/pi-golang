@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // LLMConfig 持有 LLM 供应商设置。
@@ -22,7 +23,9 @@ type AgentConfig struct {
 	Name          string
 	SystemPrompt  string
 	Temperature   float64
+	MaxTokens     int
 	MaxIterations int
+	Timeout       time.Duration
 }
 
 // LogConfig 控制日志器。
@@ -92,7 +95,9 @@ func Load() (Config, error) {
 			Name:          env("AGENT_NAME", "pi-agent"),
 			SystemPrompt:  env("AGENT_SYSTEM_PROMPT", ""),
 			Temperature:   envFloat("AGENT_TEMPERATURE", 0.7),
+			MaxTokens:     envInt("AGENT_MAX_TOKENS", 0),
 			MaxIterations: envInt("AGENT_MAX_ITERATIONS", 5),
+			Timeout:       envDuration("AGENT_TIMEOUT", 0),
 		},
 		Log: LogConfig{
 			Level: env("LOG_LEVEL", "info"),
@@ -171,6 +176,12 @@ func (c Config) Validate() error {
 	if c.Agent.MaxIterations < 1 {
 		return errors.New("config: AGENT_MAX_ITERATIONS 必须 >= 1")
 	}
+	if c.Agent.MaxTokens < 0 {
+		return errors.New("config: AGENT_MAX_TOKENS 必须 >= 0")
+	}
+	if c.Agent.Timeout < 0 {
+		return errors.New("config: AGENT_TIMEOUT 必须 >= 0")
+	}
 	if c.Audit.ContentMode != string(AuditContentRedacted) && c.Audit.ContentMode != string(AuditContentFull) {
 		return errors.New("config: AUDIT_CONTENT_MODE 必须是 redacted 或 full")
 	}
@@ -197,6 +208,15 @@ func envFloat(k string, def float64) float64 {
 	if raw, ok := os.LookupEnv(k); ok {
 		if v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64); err == nil {
 			return v
+		}
+	}
+	return def
+}
+
+func envDuration(k string, def time.Duration) time.Duration {
+	if raw, ok := os.LookupEnv(k); ok {
+		if value, err := time.ParseDuration(strings.TrimSpace(raw)); err == nil {
+			return value
 		}
 	}
 	return def

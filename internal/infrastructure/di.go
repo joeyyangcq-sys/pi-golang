@@ -127,7 +127,9 @@ func (g *Graph) NewAgent(_ context.Context, opts ...entity.Option) *entity.Agent
 			SystemPrompt:  g.Prompt.Content,
 			Model:         g.Config.LLM.Model,
 			Temperature:   g.Config.Agent.Temperature,
+			MaxTokens:     g.Config.Agent.MaxTokens,
 			MaxIterations: g.Config.Agent.MaxIterations,
+			Timeout:       g.Config.Agent.Timeout,
 		}),
 		entity.WithLLM(g.LLM),
 		entity.WithMemory(g.Memory),
@@ -207,13 +209,14 @@ func newCompatibleProvider(name string, cfg Config, defaultBaseURL string, requi
 	if baseURL == "" {
 		baseURL = defaultBaseURL
 	}
-	return adapter.NewOpenAICompatible(
+	return adapter.NewOpenAICompatibleWithOptions(
 		name,
 		cfg.LLM.APIKey,
 		baseURL,
 		cfg.LLM.Model,
 		requireAPIKey,
 		nil,
+		adapter.OpenAICompatibleOptions{ContinueWithToolsAfterToolCall: name != "lmstudio"},
 	)
 }
 

@@ -6,7 +6,7 @@
 
 - **插件扩展**：**16 个阶段钩子**覆盖 Execute 循环的**每个时间点**（RunStart/Validated、TurnStart/End、ConversationBuilt、IterationStart/End/Max、LLMBefore/After、FinalAnswer、ToolLookup/NotFound/Before/After/ReplyAppended），可改主流程数据。
 - **事件机制**：`EventBus` 发布/订阅，在每个时间点广播对应事件（含 `EventError`），只读观察旁路，不阻断主流程。
-- **错误回传**：工具/插件报错（含 panic、拒绝、未找到）都转成 `ToolReply` 回传 LLM；致命钩子错误终止运行，非致命错误经 `EventError` 旁路捕捉。
+- **错误回传**：已验证的工具/插件报错（含 panic、拒绝、未找到）都转成 `ToolReply` 回传 LLM；畸形模型工具调用会在执行前隔离，致命钩子错误终止运行，非致命错误经 `EventError` 旁路捕捉。
 - **零三方 Entity 层**：核心实体仅依赖 Go 标准库。
 
 ## 项目结构
@@ -147,8 +147,14 @@ python3 scripts/run_local_tetris.py --model '已加载的模型 ID'
 如果 LM Studio 未开启认证，可以省略 `LM_API_TOKEN`。如果没有显式 `--model`，
 脚本会从 `/v1/models` 选择第一个已加载模型。
 
-Anthropic 与 Gemini 当前先支持文本循环；它们的原生工具/流式载荷留待
-下一阶段。不要将 OpenAI 的工具消息格式直接发送给这两个原生 API。
+OpenAI-compatible、Anthropic 和 Gemini provider 都默认请求 SSE 流式响应：OpenAI
+发送 `stream=true`，Anthropic 使用 Messages 原生事件，Gemini 使用
+`streamGenerateContent?alt=sse`。三者共用同一套 HTTP 生命周期、SSE 分帧、响应大小限制、
+取消、超时阶段和错误分类；首个响应 chunk 会在完整生成结束前到达。默认 HTTP 客户端
+分别使用 60 秒响应头等待和 10 分钟整体安全上限，不再用 60 秒总超时中断长生成。
+调用方传入的更短 context deadline 仍优先，也可随时取消请求；不支持 SSE、但返回普通
+JSON 的兼容网关仍可正常解析。Anthropic 与 Gemini 当前只接入原生文本流，不要将
+OpenAI 的工具消息格式直接发送给这两个 API。
 
 ## 调试最小循环
 
@@ -156,9 +162,22 @@ Anthropic 与 Gemini 当前先支持文本循环；它们的原生工具/流式�
 系统提示词打印到 `stderr`，最终回答仍只写入 `stdout`，所以可以安全地
 用管道收集答案。系统提示词可能含业务信息，不要在生产日志中长期打开。
 
+运行预算可通过 `AGENT_MAX_TOKENS`（单次输出上限）和 `AGENT_TIMEOUT`（整次运行，
+例如 `10m`）设置；未设置时分别使用 provider 默认值和调用方 context。
+
 ```bash
 # 查看每轮 LLM 调用数、工具调用数等 JSON 结构化日志
 LOG_LEVEL=debug go run . run -prompt "hello" --debug
+
+# auto 保留通用 Agent 能力；纯文本/HTML 任务要关闭工具必须显式指定。
+go run . run --tools=disabled --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' \
+	--model '已加载的模型 ID' --prompt '只返回完整的单文件 HTML 页面。'
+
+go run . run --tools=enabled --task-profile agent-mutation \
+	--provider lmstudio --model '已加载的模型 ID' --prompt '读取 README 后更新文档。'
+
+# task-profile 也是显式能力边界；generation 只允许安全的无工具降级。
+go run . run --tools=disabled --task-profile generation --prompt '只返回纯文本摘要。'
 
 # 使用环境变量覆盖内置 prompts/base.md；输出会标记为 agent.override
 AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run -prompt "你好" --debug
@@ -186,9 +205,22 @@ AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run
 ## LLM 输入输出审计
 
 设置 `AUDIT_LOG_FILE` 或传入 `--audit-file` 后，Agent 会为**每轮**模型
-调用写入三类 JSONL 事件：`request`、`response`、`error`。它们共用 `run_id`
+调用写入五类 JSONL 事件：`request`、`response`、`error`、`tool_validation`、`tool_dispatch`。它们共用 `run_id`
 和 `iteration`，请求事件包含最终发给模型的完整 messages（含系统提示词），
 响应事件包含原始 provider 输出、工具调用与 token 用量。
+
+`tool_validation` 是工具执行前的协议边界：它记录参数长度、JSON/schema 是否
+通过、稳定失败类别和恢复策略，但默认不保存参数原文。`generation` profile 首次
+遇到畸形 tool call 会丢弃该模型消息并以 no-tools 发起一次干净续轮；`agent-readonly`
+和 `agent-mutation` 则安全失败，避免读写副作用被隐式重试。响应/错误记录还会保存
+adapter 实际使用的 request shape（是否启用 stream、是否携带 tools、tool result 数、
+assistant tool-call content 的 null/text 形态），用于定位 provider 模板兼容问题。
+`tool_dispatch` 只在整批参数通过校验后写入，因此报告可以区分“模型请求工具”与
+“实际调度工具”，避免把被拒绝的畸形调用误计为执行。
+
+每条 response/error 审计还包含 adapter 的 `first_byte_ms`、`first_event_ms` 和
+`first_content_ms`，以及 `request_shape` 中的消息角色/长度、payload 大小和摘要，
+用于区分连接、模型排队、首 token 和完整生成耗时；不会默认保存请求原文。
 
 默认 `redacted` 模式只保存长度和 SHA-256 摘要；要保存 prompt、用户输入与
 模型输出原文，必须显式选择 `full`，并将文件目录访问权限制给审计人员。
@@ -202,6 +234,15 @@ go run . run --audit-file ./var/audit/llm.jsonl --audit-content full --prompt 'h
 
 # 只看某一次运行的全部模型交互
 jq 'select(.run_id == "<run-id>")' ./var/audit/llm.jsonl
+```
+
+如需定位某个 LM Studio 续轮 payload，只能在受控本地环境采样 `full` 审计，并使用
+下面脚本重放；脚本不会执行工具。它可以单独切换 assistant `content` 的 null/省略
+形态和续轮是否携带 `tools`，每次只改变一个协议变量：
+
+```bash
+python3 scripts/replay_tool_protocol.py \
+  --audit-record ./var/audit/llm.jsonl --iteration 2 --dry-run
 ```
 
 文件以 owner-only 权限创建，并在每条记录后 `Sync`；因此审计可靠性优先于
@@ -218,6 +259,11 @@ go test -race ./...
 go test ./tests/unit/usecase -run TestExecute_ToolSuccess -v
 go test ./tests/unit/adapter -run TestAnthropicProvider -v
 
+# 已知 LM Studio 回归：畸形 tool call 不应进入续轮而触发 500；
+# 同时覆盖 response-header timeout 和非 HTML 产物保护。无需真实 LLM。
+go test -count=10 -run 'TestExecute_LMStudio500Regression_MalformedToolCallNeverReachesContinuation|TestOpenAIProvider_ChatClassifiesResponseHeaderTimeout|TestSaveHTMLArtifact_RejectsTruncatedModelAnswerWithoutOverwritingExistingFile' \
+  ./tests/unit/usecase ./tests/unit/adapter ./tests/unit/infrastructure
+
 # Python CLI 黑盒集成测试（需要 go 与本地回环网络）
 python3 tests/integration/test_agent_cli.py
 
@@ -232,6 +278,52 @@ docker compose down -v
 Python 测试和 Compose 都使用仓库内的确定性 mock LLM，不会请求真实 API。
 Compose 提供 PostgreSQL 本地服务供后续审计 sink 接入；当前已验证的审计
 落点是 JSONL 文件，因此启动 demo 不会创建或修改数据库 schema。
+
+### Pi / pi-golang 20 次本地对比
+
+使用本机 LM Studio 做性能比较时，脚本会交替启动两个独立进程，保存每次的原始
+JSONL 事件、Go Agent 审计、墙钟耗时和 token 用量，并输出均值、P50、P95、标准差
+和成功率。默认对 Go 使用 `--no-tools`，适合纯 HTML/文本生成的公平比较。审计还会
+记录 provider、HTTP 状态、错误类别、超时阶段和实际调用次数，报告会把这些低基数
+维度单列，方便区分网络超时、服务端 5xx 和协议问题：
+
+```bash
+python3 scripts/benchmark_compare.py --runs 20 \
+  --model '已加载的模型 ID' \
+  --output-dir artifacts/comparison/benchmark-20
+```
+
+如果要量化当前默认工具对任务的影响，显式开启 `--go-tools`，结果写到独立目录，
+不要和 no-tools 结果混合。注意这仍是 Go tools vs Pi no-tools，不应解读为两个
+工具协议的公平对比：
+
+```bash
+python3 scripts/benchmark_compare.py --runs 20 --go-tools \
+  --output-dir artifacts/comparison/benchmark-20-tools
+```
+
+要比较真实工具循环，两个 runner 都开启工具，并优先换成只读、确定性的单工具任务：
+
+```bash
+python3 scripts/benchmark_compare.py --runs 20 --go-tools --pi-tools \
+  --output-dir artifacts/comparison/benchmark-20-both-tools
+```
+
+报告会额外统计 `tool_validation` 的失败类别、干净降级次数，以及 HTML 静态质量检查。
+这些是审计/离线指标；当前 CLI 不是常驻 HTTP 服务，因此尚未暴露 Prometheus endpoint。
+
+脚本会把失败请求单独计入成功率，性能均值只使用成功运行；已有记录可只重算报告：
+
+```bash
+python3 scripts/benchmark_compare.py --report-only \
+  artifacts/comparison/benchmark-20/records.jsonl
+```
+
+`artifacts/`、`var/`、日志和本地 benchmark 原始记录属于可再生运行产物，已由
+`.gitignore` 排除，不会随源码提交；需要分享结果时请单独导出报告或压缩归档。
+
+报告重点观察：成功率、P95 耗时、reasoning token、工具调用率，以及 HTTP 500、超时、
+`tool_call` 参数错误的分布。单次或小样本的“快百分比”不能替代这些指标。
 
 ### 测试目录约定与调试
 
@@ -268,6 +360,6 @@ Agent 每轮的 prompt、请求、响应和错误会进入审计 sink；默认�
 ## 下一步
 
 - 加 Anthropic 与远端工具调用协议（assistant tool_calls / tool_call_id）
-- 加流式输出（RunUsecase 加 Event 通道）
+- 把 adapter 已接收的 SSE 增量通过 RunUsecase Event 通道实时暴露给调用方
 - 加 Planner 策略
 - 接持久化 Memory（Redis / SQLite）

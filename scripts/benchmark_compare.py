@@ -142,9 +142,13 @@ def parse_pi_events(stdout: str) -> Dict[str, Any]:
         usage["cache_write"] += int_value(raw_usage.get("cacheWrite"))
         output_chars += len(assistant_text(message))
 
-    success = bool(assistant_messages) and bool(assistant_text(assistant_messages[-1]))
+    final_text = assistant_text(assistant_messages[-1]) if assistant_messages else ""
+    quality = validate_html_output(final_text)
+    transport_success = bool(assistant_messages) and bool(final_text)
     return {
-        "success": success,
+        "success": transport_success and quality["task_success"],
+        "transport_success": transport_success,
+        **quality,
         "usage": usage,
         "tool_calls": tool_calls,
         "errors": errors,
@@ -157,17 +161,70 @@ def parse_pi_events(stdout: str) -> Dict[str, Any]:
 def parse_go_audit(path: Path) -> Dict[str, Any]:
     usage = {"input": 0, "output": 0, "total": 0, "reasoning": 0, "cache_read": 0, "cache_write": 0}
     request_tools = 0
-    tool_calls = 0
+    # Keep model requests and actual dispatches distinct. A malformed model
+    # tool call is never an execution, even though it appeared in a response.
+    model_tool_calls = 0
+    tool_dispatches = 0
     errors = 0
     request_messages_chars = 0
     response_chars = 0
     records = 0
+    providers: Dict[str, int] = {}
+    error_classes: Dict[str, int] = {}
+    http_statuses: Dict[str, int] = {}
+    timeout_phases: Dict[str, int] = {}
+    retry_count = 0
+    protocol_failures: Dict[str, int] = {}
+    recovery_strategies: Dict[str, int] = {}
+    first_byte_ms = 0
+    first_event_ms = 0
+    first_content_ms = 0
     if path.exists():
         for record in safe_json_lines(path.read_text(encoding="utf-8")):
             records += 1
             phase = record.get("phase")
+            provider = record.get("provider")
+            if isinstance(provider, str) and provider:
+                providers[provider] = providers.get(provider, 0) + 1
+            retry_count += max(int_value(record.get("attempts")) - 1, 0)
+            if phase == "tool_validation":
+                reason = record.get("error_class")
+                if not isinstance(reason, str) or not reason:
+                    protocol = record.get("tool_protocol") or {}
+                    reason = protocol.get("validation_reason") if isinstance(protocol, dict) else "unknown"
+                key = reason if isinstance(reason, str) and reason else "unknown"
+                protocol_failures[key] = protocol_failures.get(key, 0) + 1
+                strategy = record.get("recovery_strategy")
+                if isinstance(strategy, str) and strategy:
+                    recovery_strategies[strategy] = recovery_strategies.get(strategy, 0) + 1
+            elif phase == "tool_dispatch":
+                tool_dispatches += 1
             if phase == "error":
                 errors += 1
+                error_class = record.get("error_class")
+                if isinstance(error_class, str) and error_class:
+                    error_classes[error_class] = error_classes.get(error_class, 0) + 1
+                status = int_value(record.get("http_status"))
+                if status:
+                    key = str(status)
+                    http_statuses[key] = http_statuses.get(key, 0) + 1
+                timeout_phase = record.get("timeout_phase")
+                if isinstance(timeout_phase, str) and timeout_phase:
+                    timeout_phases[timeout_phase] = timeout_phases.get(timeout_phase, 0) + 1
+            if phase in {"response", "error"}:
+                for field, current in (
+                    ("first_byte_ms", first_byte_ms),
+                    ("first_event_ms", first_event_ms),
+                    ("first_content_ms", first_content_ms),
+                ):
+                    value = int_value(record.get(field))
+                    if value > 0 and (current == 0 or value < current):
+                        if field == "first_byte_ms":
+                            first_byte_ms = value
+                        elif field == "first_event_ms":
+                            first_event_ms = value
+                        else:
+                            first_content_ms = value
             request = record.get("request") or {}
             if phase == "request":
                 tools = request.get("Tools") or request.get("tools") or []
@@ -183,24 +240,82 @@ def parse_go_audit(path: Path) -> Dict[str, Any]:
                 usage["cache_read"] += int_value(raw_usage.get("CacheRead", raw_usage.get("cache_read")))
                 usage["cache_write"] += int_value(raw_usage.get("CacheWrite", raw_usage.get("cache_write")))
                 calls = response.get("ToolCalls") or response.get("tool_calls") or []
-                tool_calls += len(calls)
+                model_tool_calls += len(calls)
                 content = response.get("Content", response.get("content", ""))
                 response_chars += len(content) if isinstance(content, str) else 0
 
     return {
         "success": records > 0 and errors == 0 and usage["total"] > 0,
+        "transport_success": records > 0 and errors == 0 and usage["total"] > 0,
         "usage": usage,
         "request_tools": request_tools,
-        "tool_calls": tool_calls,
+        "tool_calls": tool_dispatches,
+        "model_tool_calls": model_tool_calls,
         "errors": errors,
         "request_messages_chars": request_messages_chars,
         "output_chars": response_chars,
         "records": records,
+        "providers": providers,
+        "error_classes": error_classes,
+        "http_statuses": http_statuses,
+        "timeout_phases": timeout_phases,
+        "retry_count": retry_count,
+        "protocol_failures": protocol_failures,
+        "recovery_strategies": recovery_strategies,
+        "first_byte_ms": first_byte_ms,
+        "first_event_ms": first_event_ms,
+        "first_content_ms": first_content_ms,
     }
 
 
+def validate_html_output(text: str) -> Dict[str, Any]:
+    # Match the CLI artifact boundary: Markdown fences or a short preface do
+    # not invalidate an otherwise complete HTML document. Compare the final
+    # artifact shape rather than formatting wrappers emitted by a runner.
+    value = text.strip()
+    initial_lower = value.lower()
+    starts = [index for index in (initial_lower.find("<!doctype html"), initial_lower.find("<html")) if index >= 0]
+    if starts:
+        value = value[min(starts) :]
+        end = value.lower().rfind("</html>")
+        if end >= 0:
+            value = value[: end + len("</html>")]
+    lower = value.lower()
+    issues: List[str] = []
+    if not (lower.startswith("<!doctype html") or lower.startswith("<html")):
+        issues.append("not_single_html_document")
+    if "<html" not in lower or "</html>" not in lower:
+        issues.append("missing_html_root")
+    if "<style" not in lower or "<script" not in lower:
+        issues.append("missing_inline_assets")
+    if re.search(r"(?is)<(?:script|img|link)\\b[^>]+(?:src|href)\\s*=\\s*['\"]https?://", value) or "@import url(" in lower:
+        issues.append("external_resource")
+    required_groups = [
+        ("score", "分数"),
+        ("line", "行数"),
+        ("level", "等级"),
+        ("next", "下一个"),
+    ]
+    if any(not any(marker in lower for marker in group) for group in required_groups):
+        issues.append("missing_game_status")
+    if "keydown" not in lower or not all(marker.lower() in lower for marker in ("ArrowLeft", "ArrowRight", "ArrowDown")):
+        issues.append("missing_keyboard_controls")
+    return {"task_success": not issues, "quality_issues": issues}
+
+
+def validate_html_artifact(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {"task_success": False, "quality_issues": ["artifact_missing"]}
+    return validate_html_output(path.read_text(encoding="utf-8"))
+
+
 def parse_go_stdout(stdout: str) -> Dict[str, Any]:
-    match = re.search(r"usage:\s+input\s+(\d+)\s+output\s+(\d+)\s+total\s+(\d+)\s+quality\s+(\w+)", stdout)
+    match = re.search(
+        r"usage:\s+input\s+(\d+)\s+output\s+(\d+)"
+        r"(?:\s+reasoning\s+\d+\s+cache_read\s+\d+\s+cache_write\s+\d+)?"
+        r"\s+total\s+(\d+)\s+quality\s+(\w+)",
+        stdout,
+    )
     if not match:
         return {"usage_quality": "missing"}
     return {
@@ -228,29 +343,75 @@ def percentile(values: Sequence[float], fraction: float) -> float:
 
 def summarize(records: Sequence[Dict[str, Any]], backend: str) -> Dict[str, Any]:
     selected = [record for record in records if record["backend"] == backend]
+    successful = [record for record in selected if record["success"]]
     fields = ["wall_ms", "input", "output", "total", "reasoning", "cache_read", "cache_write", "tool_calls"]
-    result: Dict[str, Any] = {"runs": len(selected), "successes": sum(1 for r in selected if r["success"])}
+    result: Dict[str, Any] = {
+        "runs": len(selected),
+        "successes": len(successful),
+        "success_rate": round(len(successful) / len(selected), 3) if selected else 0.0,
+        "basis": "successful runs only",
+        "all_attempts": {},
+    }
     for field in fields:
-        values = [float(r[field]) for r in selected]
-        result[field] = {
+        values = [float(r[field]) for r in successful]
+        attempt_values = [float(r[field]) for r in selected]
+        result[field] = stats(values)
+        result["all_attempts"][field] = stats(attempt_values)
+    return result
+
+
+def stats(values: Sequence[float]) -> Dict[str, float]:
+    return {
             "mean": round(statistics.mean(values), 3) if values else 0.0,
             "median": round(statistics.median(values), 3) if values else 0.0,
             "p95": round(percentile(values, 0.95), 3),
             "stddev": round(statistics.stdev(values), 3) if len(values) > 1 else 0.0,
-        }
-    return result
+    }
+
+
+def flatten_usage(record: Dict[str, Any]) -> None:
+    usage = record.get("usage") or {}
+    for field in ("input", "output", "total", "reasoning", "cache_read", "cache_write"):
+        record[field] = int_value(usage.get(field))
+    record.setdefault("tool_calls", 0)
+    record.setdefault("model_tool_calls", record["tool_calls"])
+    record.setdefault("errors", 0)
+    record.setdefault("providers", {})
+    record.setdefault("error_classes", {})
+    record.setdefault("http_statuses", {})
+    record.setdefault("timeout_phases", {})
+    record.setdefault("retry_count", 0)
+    record.setdefault("first_byte_ms", 0)
+    record.setdefault("first_event_ms", 0)
+    record.setdefault("first_content_ms", 0)
 
 
 def relative(go_value: float, pi_value: float) -> float:
     return round((go_value - pi_value) / pi_value * 100, 2) if pi_value else 0.0
 
 
+def count_breakdown(records: Sequence[Dict[str, Any]], field: str, backend: str = "pi-golang") -> Dict[str, int]:
+    totals: Dict[str, int] = {}
+    for record in records:
+        if record.get("backend") != backend:
+            continue
+        values = record.get(field) or {}
+        if not isinstance(values, dict):
+            continue
+        for key, value in values.items():
+            totals[str(key)] = totals.get(str(key), 0) + int_value(value)
+    return dict(sorted(totals.items()))
+
+
 def optimization_hints(records: Sequence[Dict[str, Any]]) -> List[str]:
     hints: List[str] = []
+    go_all = [r for r in records if r["backend"] == "pi-golang"]
     go = [r for r in records if r["backend"] == "pi-golang" and r["success"]]
     pi = [r for r in records if r["backend"] == "pi" and r["success"]]
-    if go and all(r["request_tools"] > 0 and r["tool_calls"] == 0 for r in go):
-        hints.append("纯 HTML/文本任务中工具调用为 0，但 Go 每轮仍携带工具 schema；增加任务 profile，在无需工具时关闭工具，可减少输入上下文和模型决策分支。")
+    if go_all and all(r.get("request_tools", 0) > 0 for r in go_all) and all(r.get("tool_calls", 0) == 0 for r in go_all):
+            hints.append("纯 HTML/文本任务中工具调用为 0，但 Go 每轮仍携带工具 schema；本项目应使用 --tools=disabled 做单因素对比，可减少输入上下文和模型决策分支。")
+    elif any(r.get("tool_calls", 0) > 0 for r in go_all):
+            hints.append("工具开启样本出现实际 tool call；应把工具调用成功率、参数解析失败和后续 provider 500 分开统计，纯生成任务应显式使用 --tools=disabled。")
     if go and pi:
         go_output = statistics.mean(r["output"] for r in go)
         pi_output = statistics.mean(r["output"] for r in pi)
@@ -259,7 +420,11 @@ def optimization_hints(records: Sequence[Dict[str, Any]]) -> List[str]:
         go_wall = statistics.mean(r["wall_ms"] for r in go)
         pi_wall = statistics.mean(r["wall_ms"] for r in pi)
         if go_wall > pi_wall * 1.1 and abs(relative(go_output, pi_output)) < 10:
-            hints.append("耗时差异大于输出 token 差异；重点排查 HTTP client、连接复用、首 token 等待和 JSON 序列化，给每次 LLM 调用增加 request_sent/first_byte/completed 时间点。")
+            hints.append("耗时差异大于输出 token 差异；结合 first_byte_ms/first_event_ms/first_content_ms 区分连接、模型排队和完整生成耗时，再排查 HTTP client 与连接复用。")
+        go_attempts = len(go_all)
+        pi_attempts = len([r for r in records if r["backend"] == "pi"])
+        if go_attempts and pi_attempts and len(go) / go_attempts < len(pi) / pi_attempts:
+            hints.append(f"Go 成功率为 {len(go)}/{go_attempts}，低于 Pi 的 {len(pi)}/{pi_attempts}；先按错误类型拆分 500、超时、协议/工具参数错误，再优化性能。")
     if any(r["reasoning"] == 0 for r in go) and any(r["reasoning"] > 0 for r in pi):
         hints.append("Pi 已上报 reasoning token，而 Go 当前聚合为 0；补齐 completion_tokens_details.reasoning_tokens 与 prompt cache 字段，才能区分‘模型思考多’和‘可见输出多’。")
     if any(r["errors"] for r in records):
@@ -276,13 +441,15 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         "# pi-golang vs Pi repeated benchmark",
         "",
         f"- 时间：{datetime.now(timezone.utc).isoformat()}",
-        f"- 次数：每个 runner {args.runs} 次，交替顺序，独立 session",
+        f"- 样本：Go {go_summary['runs']} 次，Pi {pi_summary['runs']} 次；每次独立 session",
         f"- Endpoint：`{args.base_url}`",
         f"- Model：`{args.model}`",
-        "- 任务：相同俄罗斯方块单文件 HTML prompt；Pi 禁用内置工具，Go 使用当前默认工具注册",
+        f"- 任务：相同俄罗斯方块单文件 HTML prompt；Pi {'携带内置工具' if args.pi_tools else '禁用内置工具'}，Go {'携带默认工具' if args.go_tools else '使用 --no-tools'}",
         "- 注意：这是本机 LM Studio 的重复样本，不是跨机器基准；模型缓存、温度和服务负载仍会影响结果。",
         "",
         "## 汇总",
+        "",
+        "主表只统计成功运行；失败次数和失败请求的部分 token 不进入性能均值。",
         "",
         "| 指标（均值） | pi-golang | Pi | Go 相对 Pi |",
         "|---|---:|---:|---:|",
@@ -290,7 +457,69 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
     for label, field in [("耗时 ms", "wall_ms"), ("输入 token", "input"), ("输出 token", "output"), ("总 token", "total"), ("reasoning token", "reasoning"), ("工具调用", "tool_calls")]:
         go_mean = go_summary[field]["mean"]
         pi_mean = pi_summary[field]["mean"]
-        lines.append(f"| {label} | {go_mean:.3f} | {pi_mean:.3f} | {relative(go_mean, pi_mean):+.2f}% |")
+        display_label = "工具执行/调度（成功样本）" if label == "工具调用" else label
+        lines.append(f"| {display_label} | {go_mean:.3f} | {pi_mean:.3f} | {relative(go_mean, pi_mean):+.2f}% |")
+    lines.extend(
+        [
+            f"| 成功率 | {go_summary['success_rate'] * 100:.1f}% | {pi_summary['success_rate'] * 100:.1f}% | — |",
+            f"| 工具调用（全部尝试均值） | {go_summary['all_attempts']['tool_calls']['mean']:.3f} | {pi_summary['all_attempts']['tool_calls']['mean']:.3f} | — |",
+        ]
+    )
+    go_timing = {
+        field: stats([float(record.get(field, 0)) for record in records if record.get("backend") == "pi-golang" and int_value(record.get(field)) > 0])
+        for field in ("first_byte_ms", "first_event_ms", "first_content_ms")
+    }
+    if any(value["mean"] > 0 for value in go_timing.values()):
+        lines.extend(
+            [
+                "",
+                "Go 首响应时间（成功/失败审计中有值的调用）",
+                "",
+                f"- first_byte_ms：`{go_timing['first_byte_ms']['mean']:.3f}` 平均，P95 `{go_timing['first_byte_ms']['p95']:.3f}`",
+                f"- first_event_ms：`{go_timing['first_event_ms']['mean']:.3f}` 平均，P95 `{go_timing['first_event_ms']['p95']:.3f}`",
+                f"- first_content_ms：`{go_timing['first_content_ms']['mean']:.3f}` 平均，P95 `{go_timing['first_content_ms']['p95']:.3f}`",
+            ]
+        )
+    go_model_tool_calls = sum(
+        int_value(record.get("model_tool_calls"))
+        for record in records
+        if record.get("backend") == "pi-golang"
+    )
+    if go_model_tool_calls:
+        go_tool_dispatches = sum(
+            int_value(record.get("tool_calls"))
+            for record in records
+            if record.get("backend") == "pi-golang"
+        )
+        lines.append(
+            f"- Go 模型工具调用：`{go_model_tool_calls}`；其中实际调度：`{go_tool_dispatches}`。"
+            "参数校验拒绝的调用不计为执行。"
+        )
+    for backend, label in (("pi-golang", "Go"), ("pi", "Pi")):
+        samples = [record for record in records if record.get("backend") == backend and "task_success" in record]
+        if samples:
+            task_successes = sum(1 for record in samples if record.get("task_success"))
+            lines.append(f"- {label} HTML 质量通过率：`{task_successes}/{len(samples)}`（静态结构检查）")
+    error_classes = count_breakdown(records, "error_classes")
+    http_statuses = count_breakdown(records, "http_statuses")
+    timeout_phases = count_breakdown(records, "timeout_phases")
+    protocol_failures = count_breakdown(records, "protocol_failures")
+    recovery_strategies = count_breakdown(records, "recovery_strategies")
+    retry_count = sum(int_value(record.get("retry_count")) for record in records if record.get("backend") == "pi-golang")
+    lines.extend(
+        [
+            "",
+            "## Go 失败分类（全部尝试）",
+            "",
+            f"- provider：`{json.dumps(count_breakdown(records, 'providers'), ensure_ascii=False)}`",
+            f"- error_class：`{json.dumps(error_classes, ensure_ascii=False)}`",
+            f"- HTTP status：`{json.dumps(http_statuses, ensure_ascii=False)}`",
+            f"- timeout phase：`{json.dumps(timeout_phases, ensure_ascii=False)}`",
+            f"- tool protocol failure：`{json.dumps(protocol_failures, ensure_ascii=False)}`",
+            f"- recovery strategy：`{json.dumps(recovery_strategies, ensure_ascii=False)}`",
+            f"- 自动重试次数：`{retry_count}`（当前 adapter 不隐式重试；此字段用于审计未来显式重试策略）",
+        ]
+    )
     lines.extend(
         [
             "",
@@ -326,21 +555,99 @@ def main() -> int:
     parser.add_argument("--output-dir", default="artifacts/comparison/benchmark-20")
     parser.add_argument("--timeout", type=float, default=180.0, help="单次运行超时秒数")
     parser.add_argument("--smoke", action="store_true", help="只跑每个 runner 1 次")
+    parser.add_argument("--go-tools", action="store_true", help="Go Agent 也携带默认工具；默认关闭以进行纯文本公平比较")
+    parser.add_argument("--pi-tools", action="store_true", help="Pi 也开启内置工具；与 --go-tools 一起使用可测试真实工具循环")
+    parser.add_argument("--go-only", action="store_true", help="只运行 Go Agent，不启动 Pi")
+    parser.add_argument("--compare-pi-records", help="go-only 模式下复用已有 records.jsonl 中的 Pi 记录作为基线")
+    parser.add_argument("--report-only", help="只用已有 records.jsonl 生成报告，不调用 LLM")
     args = parser.parse_args()
     if args.smoke:
         args.runs = 1
     if args.runs < 1:
         parser.error("--runs 必须 >= 1")
+    if args.go_only and not args.compare_pi_records:
+        parser.error("--go-only 必须同时提供 --compare-pi-records")
+
+    if args.report_only:
+        records_path = Path(args.report_only).resolve()
+        if not records_path.exists():
+            parser.error(f"records 文件不存在: {records_path}")
+        records = [value for value in safe_json_lines(records_path.read_text(encoding="utf-8"))]
+        for record in records:
+            flatten_usage(record)
+        # A go-only comparison may reuse a longer Pi baseline. Reports should
+        # compare equally sized samples; preserve the source JSONL unchanged.
+        go_count = sum(1 for record in records if record.get("backend") == "pi-golang")
+        if go_count:
+            baseline_pi = [record for record in records if record.get("backend") == "pi" and record.get("source")]
+            if len(baseline_pi) > go_count:
+                kept_pi_ids = {id(record) for record in baseline_pi[:go_count]}
+                records = [
+                    record
+                    for record in records
+                    if record.get("backend") != "pi" or not record.get("source") or id(record) in kept_pi_ids
+                ]
+        # Recompute protocol counters from the per-run audit when available.
+        # This keeps report-only mode correct after the schema evolves.
+        for record in records:
+            if record.get("backend") != "pi-golang":
+                continue
+            run = int_value(record.get("run"))
+            if run < 1:
+                continue
+            audit = parse_go_audit(records_path.parent / "go" / f"run-{run:03d}.jsonl")
+            if audit["records"]:
+                for field in ("tool_calls", "model_tool_calls", "protocol_failures", "recovery_strategies"):
+                    record[field] = audit[field]
+        # Pi stores the raw event stream. Re-parse it so report-only mode also
+        # benefits from parser and artifact-quality fixes added after a run.
+        for record in records:
+            if record.get("backend") != "pi":
+                continue
+            run = int_value(record.get("run"))
+            if run < 1:
+                continue
+            raw_path = records_path.parent / "pi" / f"run-{run:03d}.jsonl"
+            if not raw_path.exists():
+                continue
+            parsed = parse_pi_events(raw_path.read_text(encoding="utf-8"))
+            record.update(parsed)
+            flatten_usage(record)
+        # Success has the same contract for every runner: transport completed,
+        # the requested HTML artifact passed static validation, and the command
+        # itself exited successfully.
+        for record in records:
+            record["success"] = (
+                bool(record.get("transport_success", record.get("success")))
+                and bool(record.get("task_success", True))
+                and int_value(record.get("exit_code")) == 0
+            )
+        args.output_dir = str(records_path.parent)
+        args.runs = max((int(record.get("run", 0)) for record in records), default=0)
+        args.go_tools = any(int(record.get("request_tools", 0)) > 0 for record in records if record.get("backend") == "pi-golang")
+        report_path = records_path.parent / "report.md"
+        write_report(report_path, args, records)
+        (records_path.parent / "summary.json").write_text(
+            json.dumps({"pi-golang": summarize(records, "pi-golang"), "pi": summarize(records, "pi")}, ensure_ascii=False, indent=2)
+            + "\n",
+            encoding="utf-8",
+        )
+        print(f"report: {report_path}")
+        return 0
 
     pi_path = shutil.which("pi")
-    if not pi_path:
+    if not args.go_only and not pi_path:
         print("未找到 pi CLI，请先安装 pi", file=sys.stderr)
         return 2
 
     output_dir = (ROOT / args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "go").mkdir(exist_ok=True)
-    (output_dir / "pi").mkdir(exist_ok=True)
+    if not args.go_only:
+        (output_dir / "pi").mkdir(exist_ok=True)
+    records_path = output_dir / "records.jsonl"
+    if records_path.exists():
+        records_path.unlink()
     env = os.environ.copy()
     env["LLM_BASE_URL"] = args.base_url
     env["LLM_MODEL"] = args.model
@@ -360,8 +667,23 @@ def main() -> int:
         system_prompt = load_text(ROOT / "internal/prompt/base.md")
 
         records: List[Dict[str, Any]] = []
+        if args.compare_pi_records:
+            baseline_path = Path(args.compare_pi_records).resolve()
+            if not baseline_path.exists():
+                parser.error(f"Pi 基线 records 文件不存在: {baseline_path}")
+            baseline = [value for value in safe_json_lines(baseline_path.read_text(encoding="utf-8"))]
+            baseline_pi = [record for record in baseline if record.get("backend") == "pi"][: args.runs]
+            if not baseline_pi:
+                parser.error(f"Pi 基线不包含 backend=pi 记录: {baseline_path}")
+            for record in baseline_pi:
+                flatten_usage(record)
+                record["source"] = str(baseline_path)
+            records.extend(baseline_pi)
+            with records_path.open("a", encoding="utf-8") as stream:
+                for record in baseline_pi:
+                    stream.write(json.dumps(record, ensure_ascii=False) + "\n")
         for index in range(1, args.runs + 1):
-            order = ("pi-golang", "pi") if index % 2 else ("pi", "pi-golang")
+            order = ("pi-golang",) if args.go_only else (("pi-golang", "pi") if index % 2 else ("pi", "pi-golang"))
             for backend in order:
                 print(f"[{index}/{args.runs}] {backend}", flush=True)
                 raw_dir = output_dir / backend.replace("-", "_")
@@ -384,15 +706,22 @@ def main() -> int:
                         "--output",
                         str(output_dir / "go" / f"run-{index:03d}.html"),
                     ]
+                    if args.go_tools:
+                        # --output 会触发 CLI 的 auto 策略；显式 enabled 才能
+                        # 在本轮真实验证 LM Studio 的工具续轮协议。
+                        command.extend(["--tools", "enabled"])
+                    else:
+                        command.append("--no-tools")
                     code, stdout, stderr, wall_ms = run_command(command, env, args.timeout)
                     parsed = parse_go_audit(audit_path)
                     parsed.update(parse_go_stdout(stdout))
+                    parsed.update(validate_html_artifact(output_dir / "go" / f"run-{index:03d}.html"))
                     parsed["backend"] = backend
                     parsed["run"] = index
                     parsed["wall_ms"] = round(wall_ms, 3)
                     parsed["exit_code"] = code
                     parsed["stderr_tail"] = stderr[-1000:]
-                else:
+                elif not args.go_only:
                     raw_path = output_dir / "pi" / f"run-{index:03d}.jsonl"
                     command = [
                         pi_path,
@@ -403,7 +732,6 @@ def main() -> int:
                         "--api-key",
                         "lm-studio-local",
                         "--no-session",
-                        "--no-tools",
                         "--no-context-files",
                         "--no-skills",
                         "--no-prompt-templates",
@@ -419,6 +747,8 @@ def main() -> int:
                         "--",
                         USER_PROMPT,
                     ]
+                    if not args.pi_tools:
+                        command.insert(command.index("--no-context-files"), "--no-tools")
                     code, stdout, stderr, wall_ms = run_command(command, pi_env, args.timeout)
                     raw_path.write_text(stdout, encoding="utf-8")
                     parsed = parse_pi_events(stdout)
@@ -428,8 +758,13 @@ def main() -> int:
                     parsed["exit_code"] = code
                     parsed["stderr_tail"] = stderr[-1000:]
 
-                record_path = output_dir / "records.jsonl"
-                with record_path.open("a", encoding="utf-8") as stream:
+                parsed["success"] = (
+                    bool(parsed.get("transport_success", parsed.get("success")))
+                    and bool(parsed.get("task_success", True))
+                    and code == 0
+                )
+                flatten_usage(parsed)
+                with records_path.open("a", encoding="utf-8") as stream:
                     stream.write(json.dumps(parsed, ensure_ascii=False) + "\n")
                 records.append(parsed)
 

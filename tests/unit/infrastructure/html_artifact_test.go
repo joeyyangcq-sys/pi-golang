@@ -30,6 +30,28 @@ func TestNormalizeHTML_RejectsPlainText(t *testing.T) {
 	}
 }
 
+// Regression: two real no-tools benchmark samples returned short non-HTML
+// text. Saving must reject them before opening the destination for replacement.
+func TestSaveHTMLArtifact_RejectsTruncatedModelAnswerWithoutOverwritingExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "page.html")
+	const original = "<html><body>last known good</body></html>\n"
+	if err := os.WriteFile(path, []byte(original), 0o644); err != nil {
+		t.Fatalf("WriteFile() setup error = %v", err)
+	}
+
+	err := infrastructure.SaveHTMLArtifact(path, "抱歉，我无法生成完整页面。")
+	if err == nil || !strings.Contains(err.Error(), "不是完整 HTML") {
+		t.Fatalf("SaveHTMLArtifact() error = %v, want invalid HTML error", err)
+	}
+	data, readErr := os.ReadFile(path)
+	if readErr != nil {
+		t.Fatalf("ReadFile() error = %v", readErr)
+	}
+	if got := string(data); got != original {
+		t.Fatalf("invalid model output overwrote artifact: got %q, want %q", got, original)
+	}
+}
+
 func TestSaveHTMLArtifact_WritesNormalizedDocument(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "nested", "page.html")
 	if err := infrastructure.SaveHTMLArtifact(path, "```html\n<html><body>ok</body></html>\n```"); err != nil {

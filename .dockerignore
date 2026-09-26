@@ -1,5 +1,8 @@
 .git
 .DS_Store
+artifacts
 var
+logs
+*.log
 coverage.out
 *.test

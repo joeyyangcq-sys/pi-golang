@@ -125,7 +125,7 @@
 ## 4. 错误回传 LLM 策略（核心问答）
 
 > **问：每个工具和插件的报错是否都能捕捉并返回给 LLM？**
-> **答：能。** 工具路径上的所有错误都转成 `ToolReply` 追加进对话回传 LLM；其余环节错误经事件总线 `EventError` 广播 + 日志记录，不阻断主流程。
+> **答：执行阶段的工具错误能。** 已通过协议/Schema 校验的工具调用，其错误转成 `ToolReply` 追加进对话回传 LLM；不合法的模型工具调用则在执行前拦截，绝不把坏参数回传给 provider。生成型任务可在干净对话上关闭工具重试一次，代理型任务会安全失败；其余环节错误经事件总线 `EventError` 广播 + 日志记录。
 
 | 错误来源 | 处理方式 | 是否回传 LLM |
 |---|---|---|
@@ -134,6 +134,7 @@
 | `OnToolLookup` 钩子返回 err | 拒绝工具，错误作为 `ToolReply` 回传 LLM | ✅ |
 | `OnToolBefore` 钩子返回 err | 拒绝该工具，错误信息作为 `ToolReply` | ✅ |
 | 工具未找到 | `ErrToolNotFound` 信息作为 `ToolReply`（钩子可改内容） | ✅ |
+| 模型工具调用参数非 JSON / 不符合 Schema | 执行前写入 `tool_validation` 审计；生成型任务以原始干净对话关闭工具重试一次，代理型任务终止 | 不回传坏协议 |
 | `OnRunStart`/`RunValidated`/`TurnStart`/`ConversationBuilt`/`IterationStart` 返回 err | 视为致命，终止整个运行 | —（终止） |
 | `OnLLMBefore/After`、`OnFinalAnswer`、`OnMaxIterations`、`OnToolNotFound`、`OnToolAfter`、`OnToolReplyAppended`、`OnIterationEnd`、`OnTurnEnd` 返回 err | 记录 + 发布 `EventError`，用原数据继续 | 旁路捕捉 |
 | `LLM.Chat` 本身 err | 终止运行 + 发布 `EventError` + 触发 `OnTurnEnd` | —（终止） |
@@ -272,10 +273,10 @@ bus.Subscribe(entity.EventError, func(ctx context.Context, e entity.Event) error
 | 事件机制 | hooks 即事件 | hooks + 显式 `EventBus`（双通道） | 🟢 增强（多一条只读旁路） |
 | 错误回传 | 工具错误 → ToolReply 回 LLM | 同 + panic 恢复 + `EventError` 广播 | 🟢 增强 |
 | Entity 依赖 | 零三方 | 零三方（仅 Go std） | ✅ 一致 |
-| 流式输出 | 支持 | 暂未（留 Event 通道扩展位） | 🟡 待补 |
+| 流式输出 | 支持 | OpenAI-compatible、Anthropic、Gemini 均用共享 SSE transport 接收 | 🟢 已接收，调用方增量事件待补 |
 | Planner | 支持 | 暂未 | 🟡 待补 |
 
-**结论**：本项目在核心架构、插件模型、钩子语义、错误回传上与 Pi 高度一致，并在事件机制（双通道）与 panic 恢复上做了增强；流式输出、Planner、状态回滚是后续可补的简化点。
+**结论**：本项目在核心架构、插件模型、钩子语义、错误回传上与 Pi 高度一致，并在事件机制（双通道）与 panic 恢复上做了增强；三个 HTTP adapter 已在共享 transport 内流式接收，面向调用方的逐 token 事件、Planner、状态回滚仍待补。
 
 ---
 

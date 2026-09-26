@@ -22,6 +22,10 @@ type fakeLLM struct {
 	err       error // 非 nil 时第一次调用返回该错误
 }
 
+type lmStudioFake struct{ *fakeLLM }
+
+func (lmStudioFake) ContinueWithToolsAfterToolCall() bool { return false }
+
 type recordingAuditSink struct {
 	records []usecase.LLMAuditRecord
 }
@@ -79,6 +83,29 @@ func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	}
 }
 
+func TestExecute_WritesStructuredLLMFailureAudit(t *testing.T) {
+	failure := &entity.LLMError{
+		Class: entity.LLMErrorTimeout,
+		Metadata: entity.LLMCallMetadata{
+			Provider: "lmstudio", Attempts: 1, TimeoutPhase: "response_headers",
+		},
+		Err: errors.New("deadline exceeded"),
+	}
+	llm := &fakeLLM{err: failure}
+	audit := &recordingAuditSink{}
+	_, err := usecase.NewRunUsecase(nil, audit).Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{UserPrompt: "用户输入"})
+	if err == nil {
+		t.Fatal("Execute() expected error")
+	}
+	if len(audit.records) != 2 {
+		t.Fatalf("审计事件数 = %d, want 2", len(audit.records))
+	}
+	record := audit.records[1]
+	if record.Phase != "error" || record.Provider != "lmstudio" || record.ErrorClass != string(entity.LLMErrorTimeout) || record.TimeoutPhase != "response_headers" || record.Attempts != 1 {
+		t.Fatalf("结构化错误审计错误: %+v", record)
+	}
+}
+
 // errTool 总是返回错误结果。
 type errTool struct{ name string }
 
@@ -101,6 +128,17 @@ type okTool struct{ name string }
 func (t okTool) Info() entity.Info { return entity.Info{Name: t.name} }
 func (okTool) Call(context.Context, entity.Request) entity.Result {
 	return entity.Result{Content: "ok-result"}
+}
+
+type countingTool struct {
+	name  string
+	calls int
+}
+
+func (t *countingTool) Info() entity.Info { return entity.Info{Name: t.name} }
+func (t *countingTool) Call(context.Context, entity.Request) entity.Result {
+	t.calls++
+	return entity.Result{Content: "should-not-run"}
 }
 
 // aliasTool 名为 "alias"，Info().Name 返回 "real"。
@@ -317,7 +355,8 @@ func TestExecute_ToolSuccess_ToolReplyInConversation(t *testing.T) {
 		{Content: "calling", ToolCalls: []entity.ToolCall{{ID: "1", Name: "ok", Arguments: "{}"}}},
 		{Content: "done"},
 	}}
-	uc := usecase.NewRunUsecase(nil)
+	audit := &recordingAuditSink{}
+	uc := usecase.NewRunUsecase(nil, audit)
 	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, nil, nil)
 	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"})
 	if err != nil {
@@ -332,6 +371,196 @@ func TestExecute_ToolSuccess_ToolReplyInConversation(t *testing.T) {
 	}
 	if got := findToolReply(calls[1].Messages); got != "ok-result" {
 		t.Fatalf("第二次调用应看到工具结果 ok-result, 得到 %q", got)
+	}
+	if len(audit.records) != 5 {
+		t.Fatalf("audit records = %d, want 5", len(audit.records))
+	}
+	dispatch := audit.records[2]
+	if dispatch.Phase != "tool_dispatch" || dispatch.ToolProtocol.ToolName != "ok" || !dispatch.ToolProtocol.ArgumentsJSONValid || !dispatch.ToolProtocol.ArgumentsSchemaValid {
+		t.Fatalf("tool dispatch audit = %+v", dispatch)
+	}
+}
+
+func TestExecute_InvalidToolArguments_GenerationUsesCleanNoToolsFallback(t *testing.T) {
+	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{
+		{ToolCalls: []entity.ToolCall{{ID: "call-1", Name: "ok", Arguments: "not-json"}}},
+		{Content: "fallback answer"},
+	}}
+	audit := &recordingAuditSink{}
+	agent := newAgentWith(llm, []entity.Tool{okTool{name: "ok"}}, nil, nil)
+	out, err := usecase.NewRunUsecase(nil, audit).Execute(context.Background(), agent, usecase.RunInput{
+		UserPrompt:  "generate a page",
+		TaskProfile: entity.TaskProfileGeneration,
+		ToolsMode:   "enabled",
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if out.FinalAnswer != "fallback answer" {
+		t.Fatalf("fallback answer = %q", out.FinalAnswer)
+	}
+	calls := llm.callsSnapshot()
+	if len(calls) != 2 || len(calls[0].Tools) != 1 || len(calls[1].Tools) != 0 {
+		t.Fatalf("clean fallback request shape = %+v", calls)
+	}
+	for _, message := range calls[1].Messages {
+		if message.Role == entity.RoleAssistant && len(message.ToolCalls) > 0 || message.Role == entity.RoleTool {
+			t.Fatalf("fallback must not retain malformed tool history: %+v", calls[1].Messages)
+		}
+	}
+	if len(audit.records) != 5 {
+		t.Fatalf("audit records = %d, want 5", len(audit.records))
+	}
+	validation := audit.records[2]
+	if validation.Phase != "tool_validation" || validation.ErrorClass != string(entity.ToolCallArgumentsJSON) || validation.RecoveryStrategy != "clean_no_tools" || validation.ToolProtocol.ArgumentsJSONValid {
+		t.Fatalf("validation audit = %+v", validation)
+	}
+}
+
+// TestExecute_LMStudio500Regression_MalformedToolCallNeverReachesContinuation
+// reproduces the observed failure shape: LM Studio accepts the first response
+// but returns HTTP 500 when a malformed assistant tool-call exchange is echoed
+// back. The fixed path must discard that exchange and make a clean no-tools
+// request instead.
+func TestExecute_LMStudio500Regression_MalformedToolCallNeverReachesContinuation(t *testing.T) {
+	llm := &lmStudio500OnMalformedContinuation{}
+	audit := &recordingAuditSink{}
+	tool := &countingTool{name: "write_file"}
+
+	out, err := usecase.NewRunUsecase(nil, audit).Execute(context.Background(), newAgentWith(llm, []entity.Tool{tool}, nil, nil), usecase.RunInput{
+		UserPrompt:  "生成一个 HTML 页面",
+		TaskProfile: entity.TaskProfileGeneration,
+		ToolsMode:   "enabled",
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v; malformed history must not reach LM Studio", err)
+	}
+	if out.FinalAnswer != "<html><body>recovered</body></html>" {
+		t.Fatalf("final answer = %q", out.FinalAnswer)
+	}
+	if tool.calls != 0 {
+		t.Fatalf("malformed tool arguments must not execute write_file, calls = %d", tool.calls)
+	}
+	calls := llm.callsSnapshot()
+	if len(calls) != 2 || len(calls[0].Tools) != 1 || len(calls[1].Tools) != 0 || hasToolHistory(calls[1].Messages) {
+		t.Fatalf("clean retry request = %+v", calls)
+	}
+	if len(audit.records) != 5 || audit.records[2].Phase != "tool_validation" || audit.records[2].RecoveryStrategy != "clean_no_tools" {
+		t.Fatalf("audit trail = %+v", audit.records)
+	}
+	for _, record := range audit.records {
+		if record.Phase == "error" || record.Phase == "tool_dispatch" {
+			t.Fatalf("malformed call must not cause provider error or tool dispatch: %+v", audit.records)
+		}
+	}
+}
+
+func TestExecute_InvalidToolArguments_MutationFailsWithoutExecutingTool(t *testing.T) {
+	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{
+		{ToolCalls: []entity.ToolCall{{ID: "call-1", Name: "write", Arguments: "not-json"}}},
+	}}
+	tool := &countingTool{name: "write"}
+	_, err := usecase.NewRunUsecase(nil).Execute(context.Background(), newAgentWith(llm, []entity.Tool{tool}, nil, nil), usecase.RunInput{
+		UserPrompt:  "write a file",
+		TaskProfile: entity.TaskProfileAgentMutation,
+	})
+	if err == nil || !strings.Contains(err.Error(), "无效工具调用") {
+		t.Fatalf("expected controlled invalid tool error, got %v", err)
+	}
+	if tool.calls != 0 {
+		t.Fatalf("invalid arguments must not execute tool, calls = %d", tool.calls)
+	}
+	if calls := llm.callsSnapshot(); len(calls) != 1 {
+		t.Fatalf("mutation task must not retry, calls = %d", len(calls))
+	}
+}
+
+func TestExecute_SchemaMismatch_GenerationUsesCleanNoToolsFallback(t *testing.T) {
+	llm := &fakeLLM{model: "m", responses: []entity.ChatResponse{
+		{ToolCalls: []entity.ToolCall{{ID: "call-1", Name: "hello", Arguments: `{}`}}},
+		{Content: "fallback answer"},
+	}}
+	hello := entity.Info{
+		Name:        "hello",
+		InputSchema: []byte(`{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}`),
+	}
+	tool := schemaTool{info: hello}
+	_, err := usecase.NewRunUsecase(nil).Execute(context.Background(), newAgentWith(llm, []entity.Tool{tool}, nil, nil), usecase.RunInput{
+		UserPrompt:  "generate a greeting",
+		TaskProfile: entity.TaskProfileGeneration,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	calls := llm.callsSnapshot()
+	if len(calls) != 2 || len(calls[1].Tools) != 0 {
+		t.Fatalf("schema fallback request shape = %+v", calls)
+	}
+}
+
+type schemaTool struct{ info entity.Info }
+
+func (t schemaTool) Info() entity.Info { return t.info }
+func (schemaTool) Call(context.Context, entity.Request) entity.Result {
+	return entity.Result{Content: "should-not-run"}
+}
+
+type lmStudio500OnMalformedContinuation struct {
+	calls []entity.ChatRequest
+}
+
+func (f *lmStudio500OnMalformedContinuation) DefaultModel() string { return "lmstudio-test" }
+
+func (*lmStudio500OnMalformedContinuation) ContinueWithToolsAfterToolCall() bool { return false }
+
+func (f *lmStudio500OnMalformedContinuation) Chat(_ context.Context, req entity.ChatRequest) (entity.ChatResponse, error) {
+	f.calls = append(f.calls, req)
+	if len(f.calls) == 1 {
+		return entity.ChatResponse{ToolCalls: []entity.ToolCall{{
+			ID:        "call-write-1",
+			Name:      "write_file",
+			Arguments: `{"path":"index.html","content":`,
+		}}}, nil
+	}
+	if len(req.Tools) != 0 || hasToolHistory(req.Messages) {
+		return entity.ChatResponse{}, &entity.LLMError{
+			Class: entity.LLMErrorHTTP5xx,
+			Metadata: entity.LLMCallMetadata{
+				Provider: "lmstudio", HTTPStatus: 500,
+			},
+			Err: errors.New("HTTP 500: malformed tool continuation"),
+		}
+	}
+	return entity.ChatResponse{Content: "<html><body>recovered</body></html>"}, nil
+}
+
+func (f *lmStudio500OnMalformedContinuation) callsSnapshot() []entity.ChatRequest {
+	out := make([]entity.ChatRequest, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+func hasToolHistory(messages entity.Conversation) bool {
+	for _, message := range messages {
+		if message.Role == entity.RoleTool || len(message.ToolCalls) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func TestExecute_LMStudioToolContinuationOmitsTools(t *testing.T) {
+	llm := lmStudioFake{&fakeLLM{model: "m", responses: []entity.ChatResponse{
+		{ToolCalls: []entity.ToolCall{{ID: "call-1", Name: "ok", Arguments: `{}`}}},
+		{Content: "done"},
+	}}}
+	agent := newAgentWith(&llm, []entity.Tool{okTool{name: "ok"}}, nil, nil)
+	if _, err := usecase.NewRunUsecase(nil).Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "go"}); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	calls := llm.callsSnapshot()
+	if len(calls) != 2 || len(calls[0].Tools) != 1 || len(calls[1].Tools) != 0 {
+		t.Fatalf("LM Studio tool continuation 请求错误: %+v", calls)
 	}
 }
 

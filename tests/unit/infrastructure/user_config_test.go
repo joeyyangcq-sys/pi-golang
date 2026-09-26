@@ -91,6 +91,7 @@ func clearConfigEnv(t *testing.T) {
 		"LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL",
 		"LM_API_TOKEN",
 		"OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
+		"AGENT_MAX_TOKENS", "AGENT_TIMEOUT",
 	} {
 		old, hadValue := os.LookupEnv(key)
 		_ = os.Unsetenv(key)

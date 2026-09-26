@@ -12,6 +12,7 @@ import (
 	"strings"
 	"syscall"
 
+	"pi-golang/internal/entity"
 	"pi-golang/internal/infrastructure"
 	"pi-golang/internal/usecase"
 )
@@ -65,6 +66,9 @@ func cmdRun(ctx context.Context, args []string) int {
 	var auditFile string
 	var auditContent string
 	var outputFile string
+	var noTools bool
+	var toolsMode string
+	var taskProfile string
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
@@ -74,6 +78,9 @@ func cmdRun(ctx context.Context, args []string) int {
 	fs.StringVar(&auditFile, "audit-file", "", "JSONL 审计文件路径，记录每轮 LLM 输入输出")
 	fs.StringVar(&auditContent, "audit-content", "", "审计内容模式：redacted（默认）或 full")
 	fs.StringVar(&outputFile, "output", "", "把最终回答作为 HTML 原子写入文件")
+	fs.BoolVar(&noTools, "no-tools", false, "本次运行不向 LLM 注册工具（适合纯文本/HTML 生成任务）")
+	fs.StringVar(&toolsMode, "tools", "auto", "工具模式：auto（默认）、enabled、disabled")
+	fs.StringVar(&taskProfile, "task-profile", "auto", "任务 profile：auto、generation、agent-readonly、agent-mutation")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -99,6 +106,11 @@ func cmdRun(ctx context.Context, args []string) int {
 		}
 	}
 	cfg = cfg.WithAuditOverrides(auditFile, auditContent)
+	if cfg.Agent.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.Agent.Timeout)
+		defer cancel()
+	}
 	g, err := infrastructure.BuildWithConfig(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "启动:", err)
@@ -109,14 +121,28 @@ func cmdRun(ctx context.Context, args []string) int {
 			fmt.Fprintln(os.Stderr, "关闭审计日志:", closeErr)
 		}
 	}()
-	agent := g.NewAgent(ctx)
+	toolsEnabled, err := resolveToolsMode(toolsMode, noTools, outputFile, prompt)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "参数错误:", err)
+		return 2
+	}
+	profile, err := resolveTaskProfile(taskProfile, outputFile, prompt)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "参数错误:", err)
+		return 2
+	}
+	var agentOptions []entity.Option
+	if !toolsEnabled {
+		agentOptions = append(agentOptions, entity.WithTools(nil))
+	}
+	agent := g.NewAgent(ctx, agentOptions...)
 	if debug {
 		// Debug 输出写 stderr，避免与最终 answer 的 stdout 混在一起，便于
 		// 脚本只采集回答。提示词可能含业务上下文，生产环境请谨慎开启。
 		fmt.Fprintf(os.Stderr, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
 			g.Prompt.ID, g.Prompt.Version, g.Prompt.Hash, len(g.Prompt.Content))
-		fmt.Fprintf(os.Stderr, "debug: model=%q provider=%q base_url=%q max_iterations=%d tools=%d\n",
-			agent.Config().Model, g.Config.LLM.Provider, g.Config.LLM.BaseURL, agent.Config().MaxIterations, len(agent.Tools()))
+		fmt.Fprintf(os.Stderr, "debug: model=%q provider=%q base_url=%q max_tokens=%d max_iterations=%d timeout=%s tools=%d tools_mode=%s\n",
+			agent.Config().Model, g.Config.LLM.Provider, g.Config.LLM.BaseURL, agent.Config().MaxTokens, agent.Config().MaxIterations, agent.Config().Timeout, len(agent.Tools()), toolsMode)
 		for _, tool := range agent.Tools() {
 			info := tool.Info()
 			_, _ = fmt.Fprintf(os.Stderr, "debug: tool name=%q description=%q schema=%s\n",
@@ -129,7 +155,12 @@ func cmdRun(ctx context.Context, args []string) int {
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
 		"plugins", len(agent.Plugins()), "tools", len(agent.Tools()))
 
-	out, err := g.RunUsecase.Execute(ctx, agent, usecase.RunInput{UserPrompt: prompt})
+	out, err := g.RunUsecase.Execute(ctx, agent, usecase.RunInput{
+		UserPrompt:    prompt,
+		TaskProfile:   profile,
+		ToolsMode:     resolvedToolsMode(toolsMode, toolsEnabled),
+		PromptVersion: g.Prompt.Version,
+	})
 	if err != nil {
 		g.Logger.Error(ctx, "运行失败", "err", err)
 		_, _ = fmt.Fprintln(os.Stdout, "run failed:", err)
@@ -143,7 +174,9 @@ func cmdRun(ctx context.Context, args []string) int {
 		usageQuality = "reported"
 	}
 	_, _ = fmt.Fprintln(os.Stdout, "usage:", "input", out.Usage.Input,
-		"output", out.Usage.Output, "total", out.Usage.Total, "quality", usageQuality)
+		"output", out.Usage.Output, "reasoning", out.Usage.Reasoning,
+		"cache_read", out.Usage.CacheRead, "cache_write", out.Usage.CacheWrite,
+		"total", out.Usage.Total, "quality", usageQuality)
 	_, _ = fmt.Fprintln(os.Stdout, "answer:")
 	_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
 	if strings.TrimSpace(outputFile) != "" {
@@ -339,6 +372,56 @@ func defaultLocalBaseURL(provider string) string {
 	}
 }
 
+func resolveToolsMode(mode string, noTools bool, _ string, _ string) (bool, error) {
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if noTools {
+		if mode != "" && mode != "auto" && mode != "disabled" {
+			return false, fmt.Errorf("--no-tools 不能与 --tools=%s 同时使用", mode)
+		}
+		return false, nil
+	}
+	switch mode {
+	case "", "auto":
+		// 能力必须由调用方显式收窄；auto 保留通用 Agent 的工具集合。
+		// output/prompt 只描述任务，不足以安全推断其权限需求。
+		return true, nil
+	case "enabled":
+		return true, nil
+	case "disabled":
+		return false, nil
+	default:
+		return false, fmt.Errorf("--tools 必须是 auto、enabled 或 disabled")
+	}
+}
+
+func resolveTaskProfile(profile string, _ string, _ string) (entity.TaskProfile, error) {
+	switch strings.ToLower(strings.TrimSpace(profile)) {
+	case "", "auto":
+		// 未声明时保守保留完整 Agent profile；生成任务可显式选择
+		// --task-profile generation，并同时使用 --tools=disabled。
+		return entity.TaskProfileAgentMutation, nil
+	case string(entity.TaskProfileGeneration):
+		return entity.TaskProfileGeneration, nil
+	case string(entity.TaskProfileAgentReadonly):
+		return entity.TaskProfileAgentReadonly, nil
+	case string(entity.TaskProfileAgentMutation):
+		return entity.TaskProfileAgentMutation, nil
+	default:
+		return "", fmt.Errorf("--task-profile 必须是 auto、generation、agent-readonly 或 agent-mutation")
+	}
+}
+
+func resolvedToolsMode(mode string, enabled bool) string {
+	if !enabled {
+		return "disabled"
+	}
+	mode = strings.ToLower(strings.TrimSpace(mode))
+	if mode == "" || mode == "auto" {
+		return "enabled"
+	}
+	return mode
+}
+
 func printSetupHint(cfg infrastructure.Config) {
 	path, _ := infrastructure.UserConfigPath()
 	fmt.Fprintln(os.Stderr, "当前 LLM 配置不完整，未启动网络请求。")
@@ -369,7 +452,9 @@ Usage:
   AGENT_NAME           agent 名称                         (默认: pi-agent)
   AGENT_SYSTEM_PROMPT  最先注入的系统提示                   (默认: 空)
   AGENT_TEMPERATURE    0..2 采样温度                        (默认: 0.7)
+  AGENT_MAX_TOKENS     单次模型输出 token 上限               (默认: provider)
   AGENT_MAX_ITERATIONS 每次运行最大工具调用循环数           (默认: 5)
+  AGENT_TIMEOUT        整次 Agent 预算，例如 10m、1h              (默认: context)
   LOG_LEVEL            debug | info | warn | error        (默认: info)
   AUDIT_LOG_FILE        JSONL 审计文件路径；为空时不启用
   AUDIT_CONTENT_MODE    redacted | full（默认: redacted）
@@ -384,7 +469,11 @@ Usage:
 
 run flags:
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
-  --audit-file, --audit-content               仅覆盖本次运行的审计配置。
-  --output path                                将最终回答清洗后保存为 HTML 文件。
+	  --audit-file, --audit-content               仅覆盖本次运行的审计配置。
+	  --output path                                将最终回答清洗后保存为 HTML 文件。
+	  --tools auto|enabled|disabled                 auto 会为 HTML/纯文本生成关闭工具；可显式覆盖。
+	  --task-profile auto|generation|agent-readonly|agent-mutation
+	                                               generation 可在畸形 tool call 时安全降级；写入任务不会自动重试。
+	  --no-tools                                   --tools=disabled 的兼容别名。
   API key 优先级：--api-key > LLM_API_KEY > provider 专属环境变量。
 `

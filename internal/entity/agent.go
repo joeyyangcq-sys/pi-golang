@@ -3,7 +3,10 @@
 // 本包零第三方依赖（仅 Go 标准库），是 Clean Architecture 最内层。
 package entity
 
-import "errors"
+import (
+	"errors"
+	"time"
+)
 
 // AgentState 枚举 Agent 在一次运行中的生命周期状态。
 type AgentState int
@@ -34,11 +37,15 @@ func (s AgentState) String() string {
 
 // Config 是 Agent 的静态、用户可见配置。零值即合法的合理默认。
 type Config struct {
-	Name          string
-	SystemPrompt  string
-	Model         string
-	Temperature   float64
+	Name         string
+	SystemPrompt string
+	Model        string
+	Temperature  float64
+	// MaxTokens 为 0 表示由 provider 使用自己的默认值。
+	MaxTokens     int
 	MaxIterations int
+	// Timeout 为 0 表示由调用方 context 决定；大于 0 时覆盖整次运行。
+	Timeout time.Duration
 }
 
 // Option 是传给 Agent 构造器的功能选项。
