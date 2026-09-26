@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,10 +18,15 @@ Preserve the user goal, constraints, decisions, completed work, files and comman
 // ContextCompactionAudit records bounded, non-content metadata about a
 // compaction decision. It lets redacted audits explain why a summary call ran.
 type ContextCompactionAudit struct {
-	EstimatedTokens  int `json:"estimated_tokens"`
-	TriggerTokens    int `json:"trigger_tokens"`
-	SourceMessages   int `json:"source_messages"`
-	RetainedMessages int `json:"retained_messages"`
+	EstimatedTokens  int    `json:"estimated_tokens"`
+	TriggerTokens    int    `json:"trigger_tokens"`
+	SourceMessages   int    `json:"source_messages"`
+	RetainedMessages int    `json:"retained_messages"`
+	CompactedUntil   int    `json:"compacted_until,omitempty"`
+	SummaryChars     int    `json:"summary_chars,omitempty"`
+	SummarySHA256    string `json:"summary_sha256,omitempty"`
+	Fallback         bool   `json:"fallback,omitempty"`
+	FallbackReason   string `json:"fallback_reason,omitempty"`
 }
 
 // maybeCompact projects the session into the configured context budget. The
@@ -33,6 +39,7 @@ func (uc *RunUsecase) maybeCompact(
 	runID string,
 	iteration int,
 	auditMeta runAuditMetadata,
+	tools []entity.Info,
 	force bool,
 ) (entity.Conversation, entity.TokenUsage, bool, error) {
 	cfg := a.Config().ContextCompaction
@@ -43,7 +50,10 @@ func (uc *RunUsecase) maybeCompact(
 
 	snapshot := session.Snapshot()
 	conv := snapshot.Project(a.Config().SystemPrompt)
-	estimated := estimateConversationTokens(conv)
+	// Tool schemas consume the same context window as messages. Excluding them
+	// delays compaction until providers have already reduced the completion
+	// budget to a handful of tokens, especially for coding agents.
+	estimated := estimateConversationTokens(conv) + estimateToolSchemaTokens(tools)
 	trigger := cfg.ContextWindowTokens - cfg.ReserveTokens
 	if !force && estimated <= trigger {
 		return conv, entity.TokenUsage{}, false, nil
@@ -72,6 +82,7 @@ func (uc *RunUsecase) maybeCompact(
 		Request: req, Compaction: &audit,
 	}))
 	resp, err := a.LLM().Chat(ctx, req)
+	fallbackReason := ""
 	if err != nil {
 		failure, errorClass := llmFailureMetadata(err)
 		uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
@@ -81,25 +92,117 @@ func (uc *RunUsecase) maybeCompact(
 			HTTPStatus: failure.HTTPStatus, ErrorClass: string(errorClass), TimeoutPhase: failure.TimeoutPhase, Request: req,
 			RequestShape: failure.RequestShape, Error: err.Error(), Compaction: &audit,
 		}))
-		return conv, entity.TokenUsage{}, false, fmt.Errorf("context compaction: summarize history: %w", err)
+		if ctx.Err() != nil {
+			return conv, entity.TokenUsage{}, false, fmt.Errorf("context compaction: summarize history: %w", err)
+		}
+		fallbackReason = "provider_error"
 	}
+	if err == nil && len(resp.ToolCalls) != 0 {
+		validationErr := errors.New("context compaction: summarizer returned tool calls")
+		writeCompactionResponseError(uc, ctx, auditMeta, runID, iteration, model, req, resp, audit, validationErr)
+		fallbackReason = "tool_calls"
+	}
+	summary := strings.TrimSpace(resp.Content)
+	if err == nil && fallbackReason == "" && summary == "" {
+		validationErr := errors.New("context compaction: summarizer returned empty content")
+		writeCompactionResponseError(uc, ctx, auditMeta, runID, iteration, model, req, resp, audit, validationErr)
+		fallbackReason = "empty_content"
+	}
+	if fallbackReason != "" {
+		summary = deterministicCompactionSummary(input, cfg.SummaryMaxTokens)
+		if summary == "" {
+			return conv, resp.Usage, false, errors.New("context compaction: deterministic fallback is empty")
+		}
+		audit.Fallback = true
+		audit.FallbackReason = fallbackReason
+	}
+	responseAudit := audit
+	responseAudit.CompactedUntil = keepFrom
+	responseAudit.SummaryChars = len(summary)
+	responseAudit.SummarySHA256 = hashCompactionSummary(summary)
 	uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
 		RunID: runID, Iteration: iteration, Phase: "compaction_response", OccurredAt: time.Now().UTC(), Model: model,
 		Provider: resp.Metadata.Provider, ElapsedMS: resp.Metadata.Duration.Milliseconds(), FirstByteMS: resp.Metadata.TimeToFirstByte.Milliseconds(),
 		FirstEventMS: resp.Metadata.TimeToFirstEvent.Milliseconds(), FirstContentMS: resp.Metadata.TimeToFirstContent.Milliseconds(), Attempts: resp.Metadata.Attempts,
-		HTTPStatus: resp.Metadata.HTTPStatus, Request: req, Response: resp, RequestShape: resp.Metadata.RequestShape, Compaction: &audit,
+		HTTPStatus: resp.Metadata.HTTPStatus, Request: req, Response: resp, RequestShape: resp.Metadata.RequestShape, Compaction: &responseAudit,
 	}))
-	if len(resp.ToolCalls) != 0 {
-		return conv, entity.TokenUsage{}, false, errors.New("context compaction: summarizer returned tool calls")
-	}
-	summary := strings.TrimSpace(resp.Content)
-	if summary == "" {
-		return conv, entity.TokenUsage{}, false, errors.New("context compaction: summarizer returned empty content")
-	}
 	if !session.Compact(snapshot.Version, summary, keepFrom) {
 		return conv, entity.TokenUsage{}, false, errors.New("context compaction: session changed while summary was generated")
 	}
 	return session.Snapshot().Project(a.Config().SystemPrompt), resp.Usage, true, nil
+}
+
+func writeCompactionResponseError(
+	uc *RunUsecase,
+	ctx context.Context,
+	auditMeta runAuditMetadata,
+	runID string,
+	iteration int,
+	model string,
+	req entity.ChatRequest,
+	resp entity.ChatResponse,
+	audit ContextCompactionAudit,
+	err error,
+) {
+	uc.writeAudit(ctx, auditMeta.apply(LLMAuditRecord{
+		RunID: runID, Iteration: iteration, Phase: "compaction_error", OccurredAt: time.Now().UTC(), Model: model,
+		Provider: resp.Metadata.Provider, ElapsedMS: resp.Metadata.Duration.Milliseconds(), FirstByteMS: resp.Metadata.TimeToFirstByte.Milliseconds(),
+		FirstEventMS: resp.Metadata.TimeToFirstEvent.Milliseconds(), FirstContentMS: resp.Metadata.TimeToFirstContent.Milliseconds(), Attempts: resp.Metadata.Attempts,
+		HTTPStatus: resp.Metadata.HTTPStatus, ErrorClass: string(entity.LLMErrorProtocol), Request: req, Response: resp,
+		RequestShape: resp.Metadata.RequestShape, Error: err.Error(), Compaction: &audit,
+	}))
+}
+
+func deterministicCompactionSummary(input string, maxTokens int) string {
+	const prefix = "Deterministic history checkpoint; the model summarizer was unavailable. Preserve this evidence without assuming omitted work:\n"
+	budget := maxTokens - estimateTextTokens(prefix)
+	if budget < 8 {
+		return ""
+	}
+	if estimateTextTokens(input) <= budget {
+		return prefix + input
+	}
+	headBudget := budget / 3
+	tailBudget := budget - headBudget - estimateTextTokens("\n[...middle omitted...]\n")
+	if tailBudget < 1 {
+		tailBudget = 1
+	}
+	head := textPrefixWithinTokens(input, headBudget)
+	tail := textSuffixWithinTokens(input, tailBudget)
+	return prefix + head + "\n[...middle omitted...]\n" + tail
+}
+
+func textPrefixWithinTokens(text string, budget int) string {
+	runes := []rune(text)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := (low + high + 1) / 2
+		if estimateTextTokens(string(runes[:mid])) <= budget {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return string(runes[:low])
+}
+
+func textSuffixWithinTokens(text string, budget int) string {
+	runes := []rune(text)
+	low, high := 0, len(runes)
+	for low < high {
+		mid := (low + high + 1) / 2
+		if estimateTextTokens(string(runes[len(runes)-mid:])) <= budget {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	return string(runes[len(runes)-low:])
+}
+
+func hashCompactionSummary(summary string) string {
+	sum := sha256.Sum256([]byte(summary))
+	return fmt.Sprintf("%x", sum[:])
 }
 
 // isContextOverflowError recognizes the provider messages that mean the
@@ -157,6 +260,28 @@ func estimateConversationTokens(conv entity.Conversation) int {
 		total += estimateMessageTokens(message)
 	}
 	return total
+}
+
+func estimateToolSchemaTokens(tools []entity.Info) int {
+	total := 0
+	for _, tool := range tools {
+		total += 8 + estimateTextTokens(tool.Name) + estimateTextTokens(tool.Description) + estimateTextTokens(string(tool.InputSchema))
+	}
+	return total
+}
+
+func fitMaxTokensToContext(req entity.ChatRequest, cfg entity.ContextCompactionConfig) int {
+	if !cfg.Enabled() {
+		return req.MaxTokens
+	}
+	available := cfg.ContextWindowTokens - estimateConversationTokens(req.Messages) - estimateToolSchemaTokens(req.Tools)
+	if available < 1 {
+		available = 1
+	}
+	if req.MaxTokens <= 0 || req.MaxTokens > available {
+		return available
+	}
+	return req.MaxTokens
 }
 
 func estimateMessageTokens(message entity.Message) int {

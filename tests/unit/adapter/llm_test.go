@@ -38,7 +38,7 @@ func TestOpenAIProvider_Chat(t *testing.T) {
 			t.Fatalf("未提供工具时不应发送 tools: %+v", request.Tools)
 		}
 
-		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"你好，我能帮你什么？"}}],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":4}}}`))
+		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"你好，我能帮你什么？"},"finish_reason":"stop"}],"usage":{"prompt_tokens":7,"completion_tokens":9,"total_tokens":16,"prompt_tokens_details":{"cached_tokens":2,"cache_write_tokens":1},"completion_tokens_details":{"reasoning_tokens":4}}}`))
 	}))
 	defer server.Close()
 
@@ -56,7 +56,8 @@ func TestOpenAIProvider_Chat(t *testing.T) {
 		t.Fatalf("Chat() error = %v", err)
 	}
 	if response.Content != "你好，我能帮你什么？" || response.Usage.Total != 16 ||
-		response.Usage.Reasoning != 4 || response.Usage.CacheRead != 2 || response.Usage.CacheWrite != 1 {
+		response.Usage.Reasoning != 4 || response.Usage.CacheRead != 2 || response.Usage.CacheWrite != 1 ||
+		response.Metadata.FinishReason != "stop" {
 		t.Fatalf("响应转换错误: %+v", response)
 	}
 	if response.Metadata.RequestShape.ToolsPresent || response.Metadata.RequestShape.ToolResultMessages != 0 {
@@ -258,7 +259,7 @@ func TestOpenAIProvider_ChatStreamsBeforeLongGenerationCompletes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("流式响应不应等待完整生成后才收到 headers: %v", err)
 	}
-	if response.Content != "你好" || response.Usage.Total != 16 || response.Usage.Reasoning != 4 {
+	if response.Content != "你好" || response.Usage.Total != 16 || response.Usage.Reasoning != 4 || response.Metadata.FinishReason != "stop" {
 		t.Fatalf("流式响应合并错误: %+v", response)
 	}
 	if !response.Metadata.RequestShape.Stream {
@@ -292,6 +293,23 @@ func TestOpenAIProvider_ChatMergesStreamedToolCallFragments(t *testing.T) {
 	}
 	if response.Usage.Total != 20 {
 		t.Fatalf("流式 usage = %+v, want total=20", response.Usage)
+	}
+}
+
+func TestOpenAIProvider_AcceptsFinishReasonWithoutDoneSentinel(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte("data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"complete\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":3,\"completion_tokens\":1,\"total_tokens\":4}}\n\n"))
+	}))
+	defer server.Close()
+
+	provider := adapter.NewOpenAICompatible("lmstudio", "", server.URL, "test-model", false, nil)
+	response, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model"})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	if response.Content != "complete" || response.Metadata.FinishReason != "stop" || response.Usage.Total != 4 {
+		t.Fatalf("Chat() = %+v", response)
 	}
 }
 

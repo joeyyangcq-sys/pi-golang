@@ -43,7 +43,11 @@ type LLMCallMetadata struct {
 	Attempts           int
 	HTTPStatus         int
 	TimeoutPhase       string // connect | response_headers | response_body
-	RequestShape       LLMRequestShape
+	// FinishReason is the provider's normalized terminal reason (for example
+	// stop, tool_calls, or length). It is used by the coordinator to distinguish
+	// a completed answer from an exhausted generation budget.
+	FinishReason string
+	RequestShape LLMRequestShape
 }
 
 // LLMRequestShape records the stable protocol decisions made by an adapter.

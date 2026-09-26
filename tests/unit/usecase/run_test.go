@@ -68,7 +68,10 @@ func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	audit := &recordingAuditSink{}
 	uc := usecase.NewRunUsecase(nil, audit)
 
-	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{UserPrompt: "用户输入"}); err != nil {
+	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{
+		UserPrompt: "用户输入", OrchestrationID: "orch-1", OrchestrationRole: "worker", OrchestrationTask: "task-2",
+		OrchestrationAttempt: 2, PlanRevision: 1,
+	}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
 	if len(audit.records) != 2 {
@@ -80,6 +83,10 @@ func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	}
 	if request.Iteration != 1 || request.Request.Messages.Last().Content != "用户输入" || response.Response.Content != "最终回答" {
 		t.Fatalf("审计输入输出错误: %+v", audit.records)
+	}
+	if request.OrchestrationID != "orch-1" || request.OrchestrationRole != "worker" || request.OrchestrationTask != "task-2" ||
+		request.OrchestrationAttempt != 2 || request.PlanRevision != 1 {
+		t.Fatalf("审计编排元数据错误: %+v", request)
 	}
 }
 
@@ -189,6 +196,52 @@ func TestExecute_ContextOverflowCompactsAndRetriesOnce(t *testing.T) {
 	}
 	if got := len(llm.callsSnapshot()); got != 3 {
 		t.Fatalf("LLM call count = %d, want failed request + summary + retry", got)
+	}
+}
+
+func TestExecute_UsesDeterministicCompactionWhenSummarizerIsEmpty(t *testing.T) {
+	llm := &fakeLLM{responses: []entity.ChatResponse{
+		{Content: strings.Repeat("earlier answer ", 20)},
+		{Content: "", Usage: entity.TokenUsage{Input: 40, Output: 16, Total: 56}},
+		{Content: "continued successfully"},
+	}}
+	audit := &recordingAuditSink{}
+	agent := entity.NewAgent(
+		entity.WithLLM(llm),
+		entity.WithConfig(entity.Config{
+			MaxIterations: 1,
+			ContextCompaction: entity.ContextCompactionConfig{
+				ContextWindowTokens: 120, ReserveTokens: 20, KeepRecentTokens: 20,
+				SummaryMaxTokens: 64, ToolResultMaxChars: 32,
+			},
+		}),
+	)
+	uc := usecase.NewRunUsecase(nil, audit)
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: strings.Repeat("earlier request ", 20)}); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "continue"})
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if out.FinalAnswer != "continued successfully" || out.Compactions != 1 {
+		t.Fatalf("fallback compaction output = %+v", out)
+	}
+	state := agent.ConversationSession().State()
+	if !strings.Contains(state.Summary, "Deterministic history checkpoint") {
+		t.Fatalf("fallback summary = %q", state.Summary)
+	}
+	var sawError, sawFallback bool
+	for _, record := range audit.records {
+		if record.Phase == "compaction_error" {
+			sawError = true
+		}
+		if record.Phase == "compaction_response" && record.Compaction != nil && record.Compaction.Fallback {
+			sawFallback = true
+		}
+	}
+	if !sawError || !sawFallback {
+		t.Fatalf("compaction audit missing error/fallback evidence: %+v", audit.records)
 	}
 }
 

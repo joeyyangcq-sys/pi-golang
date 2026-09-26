@@ -185,22 +185,44 @@ AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run
 
 ### Agent 工具说明
 
-默认构建的 Agent 不再只有演示性质的 `hello`：还会注册工作区工具
-`list_files`、`read_file`、`write_file`。提示词会要求模型先探索、再读取、最后
-修改并验证；每个工具的描述和 JSON Schema 都会随请求发送给兼容 OpenAI 的 LLM，
-因此模型能知道参数、用途和限制。
+默认 Agent 注册与 Pi 对齐的七个 coding 工具：`read`、`bash`、`edit`、`write`、
+`find`、`grep`、`ls`。提示词会要求模型先探索、再读取、修改并验证；工具名称、
+描述和 JSON Schema 会随请求发送给兼容 OpenAI 的 LLM。
 
-工作区根目录是启动进程时的当前目录。文件工具只接受相对路径，拒绝 `..` 越界和
-指向根目录外的符号链接；读取上限默认 128 KiB（最大 1 MiB），单次写入最大 1 MiB，
-写入使用临时文件 + `fsync` + 原子替换。当前刻意没有开放任意 shell/exec；如果后续
-需要命令工具，应增加白名单、超时、输出上限和审批策略后再接入。
+工作区根目录是启动进程时的当前目录。文件工具接受工作区内的相对或绝对路径，拒绝
+`..` 越界和指向根目录外的符号链接；单次写入最大 1 MiB，并使用临时文件、`fsync`
+和原子替换。`bash` 固定从工作区启动，默认超时 120 秒、最大 1200 秒，输出限制为
+最后 2000 行或 50 KiB，并从子进程环境中移除常见凭据变量。只在调用方授予工具能力
+的任务中使用它。
 
-如需确认实际注册内容，可用 `--debug` 查看 `tools=4`，或把
+如需确认实际注册内容，可用 `--debug` 查看 `tools=7`，或把
 `LOG_LEVEL=debug` 打开观察每轮的工具调用、参数摘要和结果。
+
+### 计划驱动的多会话任务编排
+
+本地模型单个上下文难以完成长任务时，可使用 `--orchestration plan`。规划器先读取
+工作区并生成带依赖和验收标准的任务 DAG；协调器随后为每个子任务创建一个全新 worker
+会话，通过结构化结果向依赖它的任务传递进度。所有计划任务完成后，独立 verifier
+会话检查实际工作区并运行验证命令。验证失败时，它会追加有针对性的修复任务并再次验收。
+
+```bash
+go run . run --tools=enabled --task-profile agent-mutation --orchestration plan \
+  --max-plan-tasks 16 --protocol-attempts 2 --worker-attempts 1 --max-replans 2 \
+  --provider lmstudio --model '已加载的模型 ID' \
+  --prompt '先规划，再实现并验证整个任务'
+```
+
+实际 worker 会话数由规划出的任务数决定。`--max-plan-tasks`、`--protocol-attempts`、
+`--worker-attempts` 和 `--max-replans` 只作为异常计划、无效结构化输出和反复修复的熔断
+预算，不预先决定任务应拆成多少轮。`--worker-attempts` 默认 1，任务未完成时由 verifier
+生成新的修复任务，避免直接重放可能已有副作用的 worker。planner 只能使用 read 工具；
+worker 使用调用方授予的完整工具；verifier 可使用 read/execute 工具，但不能使用 mutate
+工具。当前 `bash` 属于 execute，命令自身仍可能产生文件副作用；严格只读验收需要在外层
+使用只读工作区或命令沙箱。达到预算仍未通过验收时进程返回非零状态。
 
 ### 长会话上下文压缩
 
-为模型显式设置上下文窗口后，Agent 会在输入接近 `window - reserve` 时把较早
+为模型显式设置上下文窗口后，Agent 会把消息和工具 schema 一起计入预算，在输入接近 `window - reserve` 时把较早
 历史摘要化，保留最近原文消息与完整的 tool-call/tool-result 配对。原始消息不从
 session 删除；摘要输入仅截断过长 tool result。模型返回 context overflow 时，Agent
 最多压缩一次并只重试尚未执行工具的模型请求。

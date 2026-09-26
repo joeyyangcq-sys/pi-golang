@@ -21,12 +21,11 @@ const (
 	maxWriteBytes      = 1 << 20
 )
 
-// WorkspacePlugin 提供最小但可用于真实 coding-agent 任务的文件工具。
+// WorkspacePlugin 提供与 Pi coding agent 对齐的工作区工具。
 //
-// 它有意不提供 shell/exec：第一阶段先让 Agent 能可靠地查看目录、读取文件
-// 和写入文件，同时把文件系统信任边界固定在启动时的工作区根目录。后续如果
-// 增加命令工具，应单独设计命令白名单、超时、输出上限和审批策略，不能把
-// os/exec 直接暴露给模型。
+// 文件工具把路径限制在启动目录；bash 固定以启动目录为 cwd，并使用独立的
+// 超时、输出上限和脱敏后的环境变量。调用方通过 --tools 决定本次任务是否
+// 授予这些能力。
 type WorkspacePlugin struct {
 	workspace workspaceRoot
 }
@@ -48,12 +47,16 @@ func NewWorkspacePlugin(root string) (*WorkspacePlugin, error) {
 // ID 返回稳定插件标识。
 func (*WorkspacePlugin) ID() entity.PluginID { return "pi/workspace" }
 
-// RegisterTools 返回 read_file、write_file、list_files 三个工具。
+// RegisterTools 返回与 Pi 相同名称和输入形状的七个 coding 工具。
 func (p *WorkspacePlugin) RegisterTools() []entity.Tool {
 	return []entity.Tool{
-		readFileTool{workspace: p.workspace},
-		writeFileTool{workspace: p.workspace},
-		listFilesTool{workspace: p.workspace},
+		piReadTool{workspace: p.workspace},
+		piBashTool{workspace: p.workspace},
+		piEditTool{workspace: p.workspace},
+		piWriteTool{workspace: p.workspace},
+		piFindTool{workspace: p.workspace},
+		piGrepTool{workspace: p.workspace},
+		piLSTool{workspace: p.workspace},
 	}
 }
 
@@ -126,8 +129,18 @@ func (w workspaceRoot) resolveForWrite(userPath string) (string, error) {
 
 func (w workspaceRoot) lexicalPath(userPath string) (string, error) {
 	userPath = strings.TrimSpace(userPath)
-	if userPath == "" || filepath.IsAbs(userPath) || !filepath.IsLocal(userPath) {
-		return "", errors.New("workspace: path 必须是工作区内的相对路径")
+	if userPath == "" {
+		return "", errors.New("workspace: path 不能为空")
+	}
+	if filepath.IsAbs(userPath) {
+		candidate := filepath.Clean(userPath)
+		if !w.contains(candidate) {
+			return "", errors.New("workspace: 绝对路径不能越出工作区")
+		}
+		return candidate, nil
+	}
+	if !filepath.IsLocal(userPath) {
+		return "", errors.New("workspace: path 必须位于工作区内")
 	}
 	candidate := filepath.Join(w.path, filepath.Clean(userPath))
 	if !w.contains(candidate) {

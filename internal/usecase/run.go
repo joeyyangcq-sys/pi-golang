@@ -36,6 +36,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"pi-golang/internal/entity"
@@ -68,6 +69,13 @@ type RunInput struct {
 	ToolsMode string
 	// PromptVersion correlates runs with a versioned system prompt artifact.
 	PromptVersion string
+	// Orchestration metadata correlates otherwise independent planner, worker,
+	// and verifier conversations in the audit stream.
+	OrchestrationID      string
+	OrchestrationRole    string
+	OrchestrationTask    string
+	OrchestrationAttempt int
+	PlanRevision         int
 }
 
 // RunOutput 是一次 Agent 运行的结果。
@@ -90,7 +98,24 @@ type RunOutput struct {
 	// Compactions records summaries generated to fit the configured model
 	// context budget. Their token usage is included in Usage.
 	Compactions int
+	// StopReason distinguishes a completed answer from a recoverable round
+	// boundary such as output exhaustion, an empty model response, or the
+	// per-round iteration limit.
+	StopReason RunStopReason
+	// ProviderFinishReason preserves the provider's terminal reason for audit
+	// and coordinator decisions.
+	ProviderFinishReason string
 }
+
+// RunStopReason is the stable application-level reason an Execute call ended.
+type RunStopReason string
+
+const (
+	RunStopFinalAnswer   RunStopReason = "final_answer"
+	RunStopOutputLimit   RunStopReason = "output_limit"
+	RunStopEmptyResponse RunStopReason = "empty_response"
+	RunStopMaxIterations RunStopReason = "max_iterations"
+)
 
 // RunUsecase 封装“运行 Agent 一次”用例的依赖。
 //
@@ -298,9 +323,14 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	}
 	tools := a.Tools()
 	auditMeta := runAuditMetadata{
-		PromptVersion: in.PromptVersion,
-		TaskProfile:   string(in.TaskProfile),
-		ToolsMode:     in.ToolsMode,
+		PromptVersion:        in.PromptVersion,
+		TaskProfile:          string(in.TaskProfile),
+		ToolsMode:            in.ToolsMode,
+		OrchestrationID:      in.OrchestrationID,
+		OrchestrationRole:    in.OrchestrationRole,
+		OrchestrationTask:    in.OrchestrationTask,
+		OrchestrationAttempt: in.OrchestrationAttempt,
+		PlanRevision:         in.PlanRevision,
 	}
 	if auditMeta.TaskProfile == "" {
 		auditMeta.TaskProfile = string(entity.TaskProfileAgentMutation)
@@ -361,7 +391,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		// Context compaction happens immediately before a primary model request.
 		// It only summarizes already-recorded history and has no tools, so it
 		// cannot cause a completed tool action to run again.
-		compactedConv, compactionUsage, compacted, compactErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, false)
+		compactedConv, compactionUsage, compacted, compactErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, toolInfos(tools), false)
 		if compactErr != nil {
 			a.SetState(entity.AgentError)
 			uc.publishError(bus, ctx, "context.compaction", compactErr)
@@ -403,6 +433,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			}
 			req = modified
 		}
+		req.MaxTokens = fitMaxTokensToContext(req, cfg.ContextCompaction)
 		if len(req.Tools) == 0 {
 			switch {
 			case cleanToolFallbackUsed:
@@ -454,7 +485,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			// This branch runs before any tool dispatch, so it never replays a
 			// side effect. A second overflow surfaces normally.
 			if !overflowRecoveryUsed && cfg.ContextCompaction.Enabled() && isContextOverflowError(lerr) {
-				recoveredConv, recoveryUsage, recovered, recoveryErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, true)
+				recoveredConv, recoveryUsage, recovered, recoveryErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, req.Tools, true)
 				if recoveryErr == nil && recovered {
 					overflowRecoveryUsed = true
 					conv = recoveredConv
@@ -521,6 +552,24 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		uc.publish(bus, ctx, entity.Event{Type: entity.EventLLMAfter, Payload: resp})
 
 		if len(resp.ToolCalls) == 0 {
+			out.ProviderFinishReason = resp.Metadata.FinishReason
+			if strings.EqualFold(strings.TrimSpace(resp.Metadata.FinishReason), "length") {
+				out.FinalAnswer = resp.Content
+				out.StopReason = RunStopOutputLimit
+				session.Append(entity.Assistant(resp.Content))
+				a.SetState(entity.AgentDone)
+				uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
+					FinalAnswer: out.FinalAnswer, Iterations: i + 1, Err: nil,
+				})
+				return out, nil
+			}
+			if strings.TrimSpace(resp.Content) == "" {
+				out.StopReason = RunStopEmptyResponse
+				session.Append(entity.Assistant(resp.Content))
+				a.SetState(entity.AgentDone)
+				uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: nil})
+				return out, nil
+			}
 			// ========================================================
 			// ⑨ FinalAnswer — LLM 不再要工具，准备返回最终答案
 			//    钩子可改 answer；err=非致命
@@ -543,6 +592,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 				faInfo = modified
 			}
 			out.FinalAnswer = faInfo.Answer
+			out.StopReason = RunStopFinalAnswer
 			session.Append(entity.Assistant(resp.Content))
 			a.SetState(entity.AgentDone)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
@@ -678,6 +728,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		maxInfo = modified
 	}
 	out.FinalAnswer = maxInfo.FallbackAnswer
+	out.StopReason = RunStopMaxIterations
 	a.SetState(entity.AgentDone)
 	uc.Logger.Warn(ctx, "agent 循环达到 MaxIterations 仍未得到最终答案",
 		"max", cfg.MaxIterations)
@@ -1027,10 +1078,15 @@ func hasConversationPrefix(conversation, prefix entity.Conversation) bool {
 const maxToolCallArgumentsBytes = 1 << 20
 
 type runAuditMetadata struct {
-	PromptVersion string
-	TaskProfile   string
-	ToolsMode     string
-	ToolsetHash   string
+	PromptVersion        string
+	TaskProfile          string
+	ToolsMode            string
+	ToolsetHash          string
+	OrchestrationID      string
+	OrchestrationRole    string
+	OrchestrationTask    string
+	OrchestrationAttempt int
+	PlanRevision         int
 }
 
 func (m runAuditMetadata) apply(record LLMAuditRecord) LLMAuditRecord {
@@ -1038,6 +1094,11 @@ func (m runAuditMetadata) apply(record LLMAuditRecord) LLMAuditRecord {
 	record.TaskProfile = m.TaskProfile
 	record.ToolsMode = m.ToolsMode
 	record.ToolsetHash = m.ToolsetHash
+	record.OrchestrationID = m.OrchestrationID
+	record.OrchestrationRole = m.OrchestrationRole
+	record.OrchestrationTask = m.OrchestrationTask
+	record.OrchestrationAttempt = m.OrchestrationAttempt
+	record.PlanRevision = m.PlanRevision
 	return record
 }
 

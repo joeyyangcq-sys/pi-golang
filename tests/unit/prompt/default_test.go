@@ -23,9 +23,13 @@ func TestDefault_IsStableAndIdentified(t *testing.T) {
 func TestDefault_DescribesAgentWorkflowAndTools(t *testing.T) {
 	content := prompt.Default().Content
 	for _, want := range []string{
-		"list_files",
-		"read_file",
-		"write_file",
+		"`read`",
+		"`bash`",
+		"`edit`",
+		"`write`",
+		"`find`",
+		"`grep`",
+		"`ls`",
 		"Working loop",
 		"Do not claim",
 	} {

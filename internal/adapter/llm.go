@@ -195,13 +195,18 @@ func (p *OpenAIProvider) Chat(ctx context.Context, req entity.ChatRequest) (enti
 		response = stream.response()
 	}
 	metadata.RequestShape = requestShape
-	if stream.seenEvent && !stream.done {
+	// Some OpenAI-compatible servers (including LM Studio under load) close a
+	// valid SSE response after emitting finish_reason without a trailing [DONE].
+	// A finish reason is an unambiguous terminal marker; reject only streams
+	// that contain neither terminal form.
+	if stream.seenEvent && !stream.done && strings.TrimSpace(stream.finishReason) == "" {
 		return entity.ChatResponse{}, &entity.LLMError{Class: entity.LLMErrorProtocol, Metadata: metadata, Err: fmt.Errorf("%s: 流式响应异常结束", provider)}
 	}
 	if len(response.Choices) == 0 {
 		return entity.ChatResponse{}, &entity.LLMError{Class: entity.LLMErrorProtocol, Metadata: metadata, Err: fmt.Errorf("%s: 响应没有 choices", provider)}
 	}
 	message := response.Choices[0].Message
+	metadata.FinishReason = response.Choices[0].FinishReason
 	return entity.ChatResponse{
 		Content:   message.content(),
 		ToolCalls: fromOpenAIToolCalls(message.ToolCalls),
@@ -311,7 +316,8 @@ type openAIToolCall struct {
 
 type openAIChatResponse struct {
 	Choices []struct {
-		Message openAIMessage `json:"message"`
+		Message      openAIMessage `json:"message"`
+		FinishReason string        `json:"finish_reason"`
 	} `json:"choices"`
 	Usage openAIUsage `json:"usage"`
 }
@@ -331,8 +337,9 @@ type openAIUsage struct {
 
 type openAIStreamChunk struct {
 	Choices []struct {
-		Index int `json:"index"`
-		Delta struct {
+		Index        int    `json:"index"`
+		FinishReason string `json:"finish_reason"`
+		Delta        struct {
 			Role      string `json:"role"`
 			Content   string `json:"content"`
 			ToolCalls []struct {
@@ -350,12 +357,13 @@ type openAIStreamChunk struct {
 }
 
 type openAIStreamAccumulator struct {
-	content    strings.Builder
-	usage      openAIUsage
-	toolCalls  []openAIToolCall
-	seenEvent  bool
-	seenChoice bool
-	done       bool
+	content      strings.Builder
+	usage        openAIUsage
+	toolCalls    []openAIToolCall
+	seenEvent    bool
+	seenChoice   bool
+	done         bool
+	finishReason string
 }
 
 func (a *openAIStreamAccumulator) consume(event serverSentEvent) (streamEventProgress, error) {
@@ -378,6 +386,9 @@ func (a *openAIStreamAccumulator) consume(event serverSentEvent) (streamEventPro
 		}
 		progress.ModelEvent = true
 		a.seenChoice = true
+		if choice.FinishReason != "" {
+			a.finishReason = choice.FinishReason
+		}
 		a.content.WriteString(choice.Delta.Content)
 		if choice.Delta.Content != "" {
 			progress.VisibleText = true
@@ -408,8 +419,9 @@ func (a *openAIStreamAccumulator) response() openAIChatResponse {
 	message := openAIMessage{Role: "assistant", Content: &contentText, ToolCalls: a.toolCalls}
 	return openAIChatResponse{
 		Choices: []struct {
-			Message openAIMessage `json:"message"`
-		}{{Message: message}},
+			Message      openAIMessage `json:"message"`
+			FinishReason string        `json:"finish_reason"`
+		}{{Message: message, FinishReason: a.finishReason}},
 		Usage: a.usage,
 	}
 }

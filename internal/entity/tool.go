@@ -15,7 +15,21 @@ type Info struct {
 	Name        string          `json:"name"`
 	Description string          `json:"description"`
 	InputSchema json.RawMessage `json:"input_schema,omitempty"`
+	// Access is local orchestration policy and is not sent to the model.
+	// Undeclared tools remain worker-only.
+	Access ToolAccess `json:"-"`
 }
+
+// ToolAccess classifies a tool for local orchestration policy. Execute tools
+// may still have side effects; callers that need a strict boundary must sandbox
+// the implementation. The category avoids relying on tool names.
+type ToolAccess string
+
+const (
+	ToolAccessRead    ToolAccess = "read"
+	ToolAccessExecute ToolAccess = "execute"
+	ToolAccessMutate  ToolAccess = "mutate"
+)
 
 // Request 是 Tool.Call 的唯一入参包。
 type Request struct {

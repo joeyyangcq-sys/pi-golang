@@ -70,6 +70,11 @@ func cmdRun(ctx context.Context, args []string) int {
 	var toolsMode string
 	var taskProfile string
 	var sessionFile string
+	var orchestration string
+	var maxPlanTasks int
+	var protocolAttempts int
+	var workerAttempts int
+	var maxReplans int
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
@@ -83,11 +88,41 @@ func cmdRun(ctx context.Context, args []string) int {
 	fs.StringVar(&toolsMode, "tools", "auto", "工具模式：auto（默认）、enabled、disabled")
 	fs.StringVar(&taskProfile, "task-profile", "auto", "任务 profile：auto、generation、agent-readonly、agent-mutation")
 	fs.StringVar(&sessionFile, "session", "", "会话状态 JSON 文件；重复使用以延续历史并启用跨进程压缩")
+	fs.StringVar(&orchestration, "orchestration", "single", "执行模式：single（单会话）或 plan（规划任务图并逐任务使用新会话）")
+	fs.IntVar(&maxPlanTasks, "max-plan-tasks", 32, "plan 模式允许的任务总数上限（含验证器追加的修复任务）")
+	fs.IntVar(&protocolAttempts, "protocol-attempts", 2, "plan 模式中规划和验证结构化结果的最大尝试次数")
+	fs.IntVar(&workerAttempts, "worker-attempts", 1, "plan 模式中每个任务的最大执行次数；大于 1 可能重复副作用")
+	fs.IntVar(&maxReplans, "max-replans", 2, "plan 模式验证失败后允许追加修复任务的次数")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
 	if prompt == "" {
 		prompt = "hello"
+	}
+	orchestration = strings.ToLower(strings.TrimSpace(orchestration))
+	if orchestration != "single" && orchestration != "plan" {
+		fmt.Fprintln(os.Stderr, "参数错误: --orchestration 必须是 single 或 plan")
+		return 2
+	}
+	if maxPlanTasks < 1 || maxPlanTasks > 100 {
+		fmt.Fprintln(os.Stderr, "参数错误: --max-plan-tasks 必须在 1 到 100 之间")
+		return 2
+	}
+	if protocolAttempts < 1 || protocolAttempts > 10 {
+		fmt.Fprintln(os.Stderr, "参数错误: --protocol-attempts 必须在 1 到 10 之间")
+		return 2
+	}
+	if workerAttempts < 1 || workerAttempts > 10 {
+		fmt.Fprintln(os.Stderr, "参数错误: --worker-attempts 必须在 1 到 10 之间")
+		return 2
+	}
+	if maxReplans < 0 || maxReplans > 10 {
+		fmt.Fprintln(os.Stderr, "参数错误: --max-replans 必须在 0 到 10 之间")
+		return 2
+	}
+	if orchestration == "plan" && strings.TrimSpace(sessionFile) != "" {
+		fmt.Fprintln(os.Stderr, "参数错误: plan 模式为每个角色创建独立会话，不能同时使用 --session")
+		return 2
 	}
 
 	cfg, err := infrastructure.Load()
@@ -165,13 +200,67 @@ func cmdRun(ctx context.Context, args []string) int {
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
 		"plugins", len(agent.Plugins()), "tools", len(agent.Tools()))
 
-	out, err := g.RunUsecase.Execute(ctx, agent, usecase.RunInput{
+	runInput := usecase.RunInput{
 		UserPrompt:    prompt,
 		TaskProfile:   profile,
 		ToolsMode:     resolvedToolsMode(toolsMode, toolsEnabled),
 		PromptVersion: g.Prompt.Version,
-	})
-	if strings.TrimSpace(sessionFile) != "" {
+	}
+	var finalAnswer string
+	var iterations int
+	var elapsed string
+	var usage entity.TokenUsage
+	var usageReported bool
+	var compactions int
+	var completed bool
+	var stopReason usecase.RunStopReason
+	var agentRuns int
+	var planTasks int
+	var replans int
+	var orchestrationID string
+	if orchestration == "single" {
+		out, runErr := g.RunUsecase.Execute(ctx, agent, runInput)
+		err = runErr
+		finalAnswer = out.FinalAnswer
+		iterations = out.Iterations
+		elapsed = out.Elapsed.Round(out.Elapsed.Truncate(1).Truncate(100)).String()
+		usage = out.Usage
+		usageReported = out.UsageReported
+		compactions = out.Compactions
+		stopReason = out.StopReason
+		completed = out.StopReason == usecase.RunStopFinalAnswer
+		agentRuns = 1
+	} else {
+		allTools := agent.Tools()
+		factory := func(role usecase.OrchestrationRole) *entity.Agent {
+			roleOptions := append([]entity.Option{}, agentOptions...)
+			roleOptions = append(roleOptions, entity.WithTools(orchestrationTools(allTools, role)))
+			return g.NewAgent(ctx, roleOptions...)
+		}
+		planned, runErr := g.RunUsecase.ExecutePlan(ctx, factory, usecase.PlanExecutionInput{
+			Run:              runInput,
+			MaxTasks:         maxPlanTasks,
+			ProtocolAttempts: protocolAttempts,
+			WorkerAttempts:   workerAttempts,
+			MaxReplans:       maxReplans,
+		})
+		err = runErr
+		finalAnswer = planned.FinalAnswer
+		usage = planned.Usage
+		compactions = planned.Compactions
+		completed = planned.Completed
+		agentRuns = len(planned.Runs)
+		planTasks = len(planned.Plan.Tasks)
+		replans = planned.Replans
+		orchestrationID = planned.OrchestrationID
+		elapsed = planned.Elapsed.Round(planned.Elapsed.Truncate(1).Truncate(100)).String()
+		for _, run := range planned.Runs {
+			iterations += run.Output.Iterations
+			usageReported = usageReported || run.Output.UsageReported
+			stopReason = run.Output.StopReason
+		}
+	}
+	if orchestration == "single" && strings.TrimSpace(sessionFile) != "" {
 		if saveErr := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); saveErr != nil {
 			g.Logger.Error(ctx, "保存会话失败", "path", sessionFile, "err", saveErr)
 			_, _ = fmt.Fprintln(os.Stdout, "session save failed:", saveErr)
@@ -185,25 +274,34 @@ func cmdRun(ctx context.Context, args []string) int {
 	}
 
 	_, _ = fmt.Fprintln(os.Stdout, "===============")
-	_, _ = fmt.Fprintln(os.Stdout, "iterations:", out.Iterations, " elapsed:", out.Elapsed.Round(out.Elapsed.Truncate(1).Truncate(100)))
+	_, _ = fmt.Fprintln(os.Stdout, "orchestration:", orchestration, "agent_runs:", agentRuns,
+		"plan_tasks:", planTasks, "replans:", replans, "orchestration_id:", orchestrationID,
+		"iterations:", iterations, "elapsed:", elapsed)
 	usageQuality := "missing"
-	if out.UsageReported {
+	if usageReported {
 		usageQuality = "reported"
 	}
-	_, _ = fmt.Fprintln(os.Stdout, "usage:", "input", out.Usage.Input,
-		"output", out.Usage.Output, "reasoning", out.Usage.Reasoning,
-		"cache_read", out.Usage.CacheRead, "cache_write", out.Usage.CacheWrite,
-		"total", out.Usage.Total, "quality", usageQuality)
-	_, _ = fmt.Fprintln(os.Stdout, "compactions:", out.Compactions)
+	_, _ = fmt.Fprintln(os.Stdout, "usage:", "input", usage.Input,
+		"output", usage.Output, "reasoning", usage.Reasoning,
+		"cache_read", usage.CacheRead, "cache_write", usage.CacheWrite,
+		"total", usage.Total, "quality", usageQuality)
+	_, _ = fmt.Fprintln(os.Stdout, "compactions:", compactions)
+	_, _ = fmt.Fprintln(os.Stdout, "stop_reason:", stopReason, "completed:", completed)
 	_, _ = fmt.Fprintln(os.Stdout, "answer:")
-	_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
+	_, _ = fmt.Fprintln(os.Stdout, finalAnswer)
+	if !completed {
+		g.Logger.Error(ctx, "任务未完成", "orchestration", orchestration,
+			"agent_runs", agentRuns, "plan_tasks", planTasks, "replans", replans,
+			"stop_reason", stopReason)
+		return 1
+	}
 	if strings.TrimSpace(outputFile) != "" {
-		if err := infrastructure.SaveHTMLArtifact(outputFile, out.FinalAnswer); err != nil {
+		if err := infrastructure.SaveHTMLArtifact(outputFile, finalAnswer); err != nil {
 			g.Logger.Error(ctx, "保存 HTML 失败", "path", outputFile, "err", err)
 			_, _ = fmt.Fprintln(os.Stdout, "html save failed:", err)
 			return 1
 		}
-		g.Logger.Info(ctx, "已保存 HTML", "path", outputFile, "chars", len(out.FinalAnswer))
+		g.Logger.Info(ctx, "已保存 HTML", "path", outputFile, "chars", len(finalAnswer))
 		_, _ = fmt.Fprintln(os.Stdout, "html:", outputFile)
 	}
 	return 0
@@ -440,6 +538,24 @@ func resolvedToolsMode(mode string, enabled bool) string {
 	return mode
 }
 
+// orchestrationTools gives each fresh conversation the tools its role needs.
+// Workers keep the caller's complete tool set. Planning is read-only, while
+// verification may also run commands to validate the integrated workspace.
+func orchestrationTools(all []entity.Tool, role usecase.OrchestrationRole) []entity.Tool {
+	if role == usecase.OrchestrationWorker {
+		return append([]entity.Tool(nil), all...)
+	}
+	filtered := make([]entity.Tool, 0, len(all))
+	for _, tool := range all {
+		access := tool.Info().Access
+		if access == entity.ToolAccessRead ||
+			(role == usecase.OrchestrationVerifier && access == entity.ToolAccessExecute) {
+			filtered = append(filtered, tool)
+		}
+	}
+	return filtered
+}
+
 func printSetupHint(cfg infrastructure.Config) {
 	path, _ := infrastructure.UserConfigPath()
 	fmt.Fprintln(os.Stderr, "当前 LLM 配置不完整，未启动网络请求。")
@@ -494,12 +610,17 @@ Usage:
 
 run flags:
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
-	  --audit-file, --audit-content               仅覆盖本次运行的审计配置。
-	  --output path                                将最终回答清洗后保存为 HTML 文件。
-	  --tools auto|enabled|disabled                 auto 会为 HTML/纯文本生成关闭工具；可显式覆盖。
-	  --task-profile auto|generation|agent-readonly|agent-mutation
-	                                               generation 可在畸形 tool call 时安全降级；写入任务不会自动重试。
-	  --session path                              跨进程保存会话历史和摘要状态。
-	  --no-tools                                   --tools=disabled 的兼容别名。
+  --audit-file, --audit-content               仅覆盖本次运行的审计配置。
+  --output path                                将最终回答清洗后保存为 HTML 文件。
+  --tools auto|enabled|disabled                auto 保留通用 Agent 工具；可显式收窄为 disabled。
+  --task-profile auto|generation|agent-readonly|agent-mutation
+                                               generation 可在畸形 tool call 时安全降级；写入任务不会自动重试。
+  --session path                               single 模式跨进程保存会话历史和摘要状态。
+  --orchestration single|plan                  plan 先生成任务 DAG，每个任务使用独立新会话，最后独立验收。
+  --max-plan-tasks n                           任务总数安全上限；不会预先决定实际会话数。
+  --protocol-attempts n                        规划和验收结构化输出的尝试上限。
+  --worker-attempts n                          每个任务的执行次数上限；默认 1，避免重复副作用。
+  --max-replans n                              验收失败后追加修复任务的次数上限。
+  --no-tools                                   --tools=disabled 的兼容别名。
   API key 优先级：--api-key > LLM_API_KEY > provider 专属环境变量。
 `

@@ -34,10 +34,8 @@ func TestBuildWithConfig_RegistersUsefulWorkspaceTools(t *testing.T) {
 	}
 
 	want := map[string]bool{
-		"hello":      false,
-		"list_files": false,
-		"read_file":  false,
-		"write_file": false,
+		"read": false, "bash": false, "edit": false, "write": false,
+		"find": false, "grep": false, "ls": false,
 	}
 	for _, tool := range agent.Tools() {
 		name := tool.Info().Name

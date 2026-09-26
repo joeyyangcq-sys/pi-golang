@@ -102,7 +102,6 @@ func buildPlugins(state entity.PluginStateStore, bus entity.EventBus, workspace 
 		return nil, fmt.Errorf("di: 初始化工作区工具: %w", err)
 	}
 	return []entity.Plugin{
-		NewHelloPlugin(state, bus),
 		workspacePlugin,
 	}, nil
 }

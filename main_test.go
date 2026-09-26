@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	"pi-golang/internal/entity"
+	"pi-golang/internal/usecase"
 )
 
 func TestResolveToolsMode(t *testing.T) {
@@ -63,4 +65,50 @@ func TestResolveTaskProfile(t *testing.T) {
 			}
 		})
 	}
+}
+
+type namedTool struct {
+	name   string
+	access entity.ToolAccess
+}
+
+func (tool namedTool) Info() entity.Info {
+	return entity.Info{Name: tool.name, Access: tool.access}
+}
+func (namedTool) Call(context.Context, entity.Request) entity.Result {
+	return entity.Result{}
+}
+
+func TestOrchestrationTools_RestrictsPlannerAndVerifier(t *testing.T) {
+	all := []entity.Tool{
+		namedTool{name: "read", access: entity.ToolAccessRead},
+		namedTool{name: "bash", access: entity.ToolAccessExecute},
+		namedTool{name: "edit", access: entity.ToolAccessMutate},
+		namedTool{name: "write", access: entity.ToolAccessMutate},
+		namedTool{name: "find", access: entity.ToolAccessRead},
+		namedTool{name: "grep", access: entity.ToolAccessRead},
+		namedTool{name: "ls", access: entity.ToolAccessRead},
+		namedTool{name: "custom-undeclared"},
+	}
+
+	assertNames := func(role usecase.OrchestrationRole, want []string) {
+		t.Helper()
+		gotTools := orchestrationTools(all, role)
+		got := make([]string, len(gotTools))
+		for i, tool := range gotTools {
+			got[i] = tool.Info().Name
+		}
+		if len(got) != len(want) {
+			t.Fatalf("%s tools = %v, want %v", role, got, want)
+		}
+		for i := range want {
+			if got[i] != want[i] {
+				t.Fatalf("%s tools = %v, want %v", role, got, want)
+			}
+		}
+	}
+
+	assertNames(usecase.OrchestrationPlanner, []string{"read", "find", "grep", "ls"})
+	assertNames(usecase.OrchestrationVerifier, []string{"read", "bash", "find", "grep", "ls"})
+	assertNames(usecase.OrchestrationWorker, []string{"read", "bash", "edit", "write", "find", "grep", "ls", "custom-undeclared"})
 }
