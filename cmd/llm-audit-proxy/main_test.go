@@ -37,3 +37,17 @@ func TestRunnerPath(t *testing.T) {
 		t.Fatalf("runnerPath() = %q, %q, %t", runner, path, ok)
 	}
 }
+
+func TestRunnerPathAllowsGoVariant(t *testing.T) {
+	runner, path, ok := runnerPath("/go-cwd-parts/v1/chat/completions")
+	if !ok || runner != "go-cwd-parts" || path != "/v1/chat/completions" {
+		t.Fatalf("runnerPath() = %q, %q, %t", runner, path, ok)
+	}
+}
+
+func TestRunnerPathAllowsPiVariant(t *testing.T) {
+	runner, path, ok := runnerPath("/pi-coding/v1/chat/completions")
+	if !ok || runner != "pi-coding" || path != "/v1/chat/completions" {
+		t.Fatalf("runnerPath() = %q, %q, %t", runner, path, ok)
+	}
+}

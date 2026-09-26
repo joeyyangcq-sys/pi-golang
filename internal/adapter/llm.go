@@ -64,13 +64,13 @@ type OpenAIProvider struct {
 	requireAPIKey          bool
 	continueWithToolsAfter bool
 	maxTokensField         string
+	userContentParts       bool
 	requestExtra           map[string]any
 	client                 *http.Client
 }
 
-// ContinueWithToolsAfterToolCall follows LM Studio's documented tool loop: its
-// tool-result turn must omit tools so the model produces a final answer. Other
-// OpenAI-compatible endpoints retain the original multi-turn tool behavior.
+// ContinueWithToolsAfterToolCall reports whether a valid tool-result turn may
+// keep the registered tools so a coding agent can continue its read/write loop.
 func (p *OpenAIProvider) ContinueWithToolsAfterToolCall() bool {
 	return p.continueWithToolsAfter
 }
@@ -99,7 +99,7 @@ func NewOpenAICompatible(
 	// 保留旧构造器的兼容语义；新接线应使用
 	// NewOpenAICompatibleWithOptions 显式声明续轮能力。
 	return NewOpenAICompatibleWithOptions(providerName, apiKey, baseURL, defaultModel, requireAPIKey, client,
-		OpenAICompatibleOptions{ContinueWithToolsAfterToolCall: strings.ToLower(providerName) != "lmstudio"})
+		OpenAICompatibleOptions{ContinueWithToolsAfterToolCall: true})
 }
 
 // OpenAICompatibleOptions 描述兼容端点的能力，而不是从模型回复或任务
@@ -110,6 +110,10 @@ type OpenAICompatibleOptions struct {
 	// MaxTokensField is the endpoint's documented OpenAI-compatible budget
 	// field. Empty and max_tokens both select max_tokens.
 	MaxTokensField string
+	// UserContentParts serializes user text as OpenAI content blocks instead of
+	// a plain string. The default remains false; this is mainly useful for
+	// provider compatibility checks and multimodal-ready gateways.
+	UserContentParts bool
 	// RequestExtra contains documented endpoint-specific request fields, such
 	// as a thinking switch. Core protocol fields cannot be overridden.
 	RequestExtra map[string]any
@@ -146,6 +150,7 @@ func NewOpenAICompatibleWithOptions(
 		requireAPIKey:          requireAPIKey,
 		continueWithToolsAfter: options.ContinueWithToolsAfterToolCall,
 		maxTokensField:         maxTokensField,
+		userContentParts:       options.UserContentParts,
 		requestExtra:           cloneRequestExtra(options.RequestExtra),
 		client:                 newStreamingHTTPClientWithConfig(client, options.HTTP),
 	}
@@ -220,7 +225,7 @@ func (p *OpenAIProvider) openAIRequestBody(req entity.ChatRequest) map[string]an
 		delete(body, key)
 	}
 	body["model"] = req.Model
-	body["messages"] = toOpenAIMessages(req.Messages)
+	body["messages"] = toOpenAIRequestMessages(req.Messages, p.userContentParts)
 	body["stream"] = true
 	body["stream_options"] = openAIStreamOptions{IncludeUsage: true}
 	if !req.OmitTemperature {
@@ -265,6 +270,18 @@ type openAIMessage struct {
 	Content    *string          `json:"content"`
 	ToolCallID string           `json:"tool_call_id,omitempty"`
 	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+}
+
+type openAIRequestMessage struct {
+	Role       string           `json:"role"`
+	Content    any              `json:"content"`
+	ToolCallID string           `json:"tool_call_id,omitempty"`
+	ToolCalls  []openAIToolCall `json:"tool_calls,omitempty"`
+}
+
+type openAITextContentPart struct {
+	Type string `json:"type"`
+	Text string `json:"text"`
 }
 
 func (m openAIMessage) content() string {
@@ -397,16 +414,20 @@ func (a *openAIStreamAccumulator) response() openAIChatResponse {
 	}
 }
 
-func toOpenAIMessages(conversation entity.Conversation) []openAIMessage {
-	messages := make([]openAIMessage, 0, len(conversation))
+func toOpenAIRequestMessages(conversation entity.Conversation, userContentParts bool) []openAIRequestMessage {
+	messages := make([]openAIRequestMessage, 0, len(conversation))
 	for _, message := range conversation {
-		item := openAIMessage{
-			Role:       string(message.Role),
-			ToolCallID: message.ToolCallID,
+		var content any = message.Content
+		if userContentParts && message.Role == entity.RoleUser {
+			content = []openAITextContentPart{{Type: "text", Text: message.Content}}
 		}
-		if message.Role != entity.RoleAssistant || len(message.ToolCalls) == 0 || message.Content != "" {
-			content := message.Content
-			item.Content = &content
+		if message.Role == entity.RoleAssistant && len(message.ToolCalls) > 0 && message.Content == "" {
+			content = nil
+		}
+		item := openAIRequestMessage{
+			Role:       string(message.Role),
+			Content:    content,
+			ToolCallID: message.ToolCallID,
 		}
 		if len(message.ToolCalls) > 0 {
 			item.ToolCalls = make([]openAIToolCall, 0, len(message.ToolCalls))

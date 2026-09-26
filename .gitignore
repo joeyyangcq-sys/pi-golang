@@ -11,6 +11,16 @@ logs/
 *.run.json
 *.audit.jsonl
 
+# Local agent sessions and default audit outputs.
+/.pi-agent/
+/wire-requests.jsonl
+/payload-diffs.jsonl
+/records.jsonl
+/audit-proxy.log
+
+# Leftover atomic temporary files.
+*.tmp
+
 # Go build and test output.
 /bin/
 /dist/

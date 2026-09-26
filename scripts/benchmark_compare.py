@@ -54,12 +54,13 @@ def run_command(
     command: Sequence[str],
     env: Dict[str, str],
     timeout: float,
+    cwd: Optional[Path] = None,
 ) -> Tuple[int, str, str, float]:
     started = time.perf_counter()
     try:
         completed = subprocess.run(
             list(command),
-            cwd=ROOT,
+            cwd=cwd or ROOT,
             env=env,
             text=True,
             capture_output=True,
@@ -594,8 +595,12 @@ def optimization_hints(records: Sequence[Dict[str, Any]]) -> List[str]:
     if go and pi:
         go_output = statistics.mean(r["output"] for r in go)
         pi_output = statistics.mean(r["output"] for r in pi)
-        if go_output > pi_output * 1.1:
-            hints.append("Go 输出 token 的均值明显高于 Pi；先固定 thinking/temperature，再增加 max output token 或 HTML 结构约束，避免模型过度解释/思考。")
+        go_reasoning = statistics.mean(r["reasoning"] for r in go)
+        pi_reasoning = statistics.mean(r["reasoning"] for r in pi)
+        if go_reasoning > max(pi_reasoning * 1.5, pi_reasoning + 100):
+            hints.append("Go 的额外 output 主要来自 reasoning；先对齐 system section 与 user content envelope，再决定是否设置显式 thinking 控制。不要用降低 HTML 输出上限掩盖推理分叉。")
+        elif go_output > pi_output * 1.1:
+            hints.append("Go 可见输出 token 的均值明显高于 Pi；检查两端生成物结构和停止条件后，再评估 max output token 或 prompt 约束。")
         go_wall = statistics.mean(r["wall_ms"] for r in go)
         pi_wall = statistics.mean(r["wall_ms"] for r in pi)
         if go_wall > pi_wall * 1.1 and abs(relative(go_output, pi_output)) < 10:
@@ -616,6 +621,7 @@ def optimization_hints(records: Sequence[Dict[str, Any]]) -> List[str]:
 def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[str, Any]]) -> None:
     go_summary = summarize(records, "pi-golang")
     pi_summary = summarize(records, "pi")
+    wire_summary = getattr(args, "wire_summary", None)
     lines = [
         "# pi-golang vs Pi repeated benchmark",
         "",
@@ -625,6 +631,14 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         f"- Model：`{args.model}`",
         f"- 任务：相同俄罗斯方块单文件 HTML prompt；Pi {'携带内置工具' if args.pi_tools else '禁用内置工具'}，Go {'携带默认工具' if args.go_tools else '使用 --no-tools'}",
         "- 注意：这是本机 LM Studio 的重复样本，不是跨机器基准；模型缓存、温度和服务负载仍会影响结果。",
+    ]
+    if isinstance(wire_summary, dict):
+        lines.extend([
+            f"- Wire 审计：Go `{wire_summary['go_requests']}` 个请求，Pi `{wire_summary['pi_requests']}` 个请求；"
+            f"已配对 `{wire_summary['paired_requests']}`，生成参数一致 `{wire_summary['generation_field_matches']}/{wire_summary['paired_requests']}`。",
+            "- `wire-requests.jsonl` 和 `payload-diffs.jsonl` 仅含脱敏字段、长度与 SHA-256，不写入 prompt 或 Authorization。",
+        ])
+    lines.extend([
         "",
         "## 汇总",
         "",
@@ -632,14 +646,7 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         "",
         "| 指标（均值） | pi-golang | Pi | Go 相对 Pi |",
         "|---|---:|---:|---:|",
-    ]
-    wire_summary = getattr(args, "wire_summary", None)
-    if isinstance(wire_summary, dict):
-        lines.extend([
-            f"- Wire 审计：Go `{wire_summary['go_requests']}` 个请求，Pi `{wire_summary['pi_requests']}` 个请求；"
-            f"已配对 `{wire_summary['paired_requests']}`，生成参数一致 `{wire_summary['generation_field_matches']}/{wire_summary['paired_requests']}`。",
-            "- `wire-requests.jsonl` 和 `payload-diffs.jsonl` 仅含脱敏字段、长度与 SHA-256，不写入 prompt 或 Authorization。",
-        ])
+    ])
     for label, field in [("耗时 ms", "wall_ms"), ("输入 token", "input"), ("输出 token", "output"), ("总 token", "total"), ("reasoning token", "reasoning"), ("工具调用", "tool_calls")]:
         go_mean = go_summary[field]["mean"]
         pi_mean = pi_summary[field]["mean"]
@@ -818,6 +825,9 @@ def main() -> int:
         args.output_dir = str(records_path.parent)
         args.runs = max((int(record.get("run", 0)) for record in records), default=0)
         args.go_tools = any(int(record.get("request_tools", 0)) > 0 for record in records if record.get("backend") == "pi-golang")
+        wire_path = records_path.parent / "wire-requests.jsonl"
+        if wire_path.exists():
+            args.wire_summary = write_payload_diffs(wire_path, records_path.parent / "payload-diffs.jsonl")
         report_path = records_path.parent / "report.md"
         write_report(report_path, args, records)
         (records_path.parent / "summary.json").write_text(

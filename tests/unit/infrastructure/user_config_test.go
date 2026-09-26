@@ -13,11 +13,14 @@ func TestSaveAndLoadLLMConfig_UsesPrivateAtomicFile(t *testing.T) {
 	t.Setenv("PI_AGENT_CONFIG_FILE", configPath)
 	clearConfigEnv(t)
 	want := infrastructure.LLMConfig{
-		Provider: "lmstudio",
-		BaseURL:  "http://127.0.0.1:1234/v1",
-		Model:    "local-model",
+		Provider:          "lmstudio",
+		BaseURL:           "http://127.0.0.1:1234/v1",
+		Model:             "local-model",
+		UserContentFormat: "text",
 	}
-	if err := infrastructure.SaveLLMConfig(want); err != nil {
+	persisted := want
+	persisted.UserContentFormat = ""
+	if err := infrastructure.SaveLLMConfig(persisted); err != nil {
 		t.Fatalf("SaveLLMConfig() error = %v", err)
 	}
 	info, err := os.Stat(configPath)
@@ -89,9 +92,10 @@ func clearConfigEnv(t *testing.T) {
 	t.Helper()
 	for _, key := range []string{
 		"LLM_PROVIDER", "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL",
+		"LLM_USER_CONTENT_FORMAT", "LLM_MAX_TOKENS_FIELD", "LLM_REQUEST_EXTRA_JSON",
 		"LM_API_TOKEN",
 		"OPENAI_API_KEY", "DEEPSEEK_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY",
-		"AGENT_MAX_TOKENS", "AGENT_TIMEOUT",
+		"AGENT_MAX_TOKENS", "AGENT_TIMEOUT", "AGENT_INCLUDE_WORKING_DIRECTORY",
 	} {
 		old, hadValue := os.LookupEnv(key)
 		_ = os.Unsetenv(key)

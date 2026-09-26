@@ -20,30 +20,31 @@ type LLMAuditSink interface {
 // LLMAuditRecord 表示单次模型调用的一个可持久化事件。每轮有 request
 // 以及 response 或 error 事件，因此可以按 RunID + Iteration 重放输入输出。
 type LLMAuditRecord struct {
-	RunID            string                 `json:"run_id"`
-	Iteration        int                    `json:"iteration"`
-	Phase            string                 `json:"phase"` // request | response | error | tool_validation | tool_dispatch
-	OccurredAt       time.Time              `json:"occurred_at"`
-	Model            string                 `json:"model"`
-	PromptVersion    string                 `json:"prompt_version,omitempty"`
-	TaskProfile      string                 `json:"task_profile,omitempty"`
-	ToolsMode        string                 `json:"tools_mode,omitempty"`
-	ToolsetHash      string                 `json:"toolset_hash,omitempty"`
-	Provider         string                 `json:"provider,omitempty"`
-	ElapsedMS        int64                  `json:"elapsed_ms,omitempty"`
-	FirstByteMS      int64                  `json:"first_byte_ms,omitempty"`
-	FirstEventMS     int64                  `json:"first_event_ms,omitempty"`
-	FirstContentMS   int64                  `json:"first_content_ms,omitempty"`
-	Attempts         int                    `json:"attempts,omitempty"`
-	HTTPStatus       int                    `json:"http_status,omitempty"`
-	ErrorClass       string                 `json:"error_class,omitempty"`
-	TimeoutPhase     string                 `json:"timeout_phase,omitempty"`
-	Request          entity.ChatRequest     `json:"request"`
-	Response         entity.ChatResponse    `json:"response,omitempty"`
-	RequestShape     entity.LLMRequestShape `json:"request_shape,omitempty"`
-	ToolProtocol     ToolProtocolAudit      `json:"tool_protocol,omitempty"`
-	RecoveryStrategy string                 `json:"recovery_strategy,omitempty"`
-	Error            string                 `json:"error,omitempty"`
+	RunID            string                  `json:"run_id"`
+	Iteration        int                     `json:"iteration"`
+	Phase            string                  `json:"phase"` // request | response | error | compaction_* | tool_validation | tool_dispatch
+	OccurredAt       time.Time               `json:"occurred_at"`
+	Model            string                  `json:"model"`
+	PromptVersion    string                  `json:"prompt_version,omitempty"`
+	TaskProfile      string                  `json:"task_profile,omitempty"`
+	ToolsMode        string                  `json:"tools_mode,omitempty"`
+	ToolsetHash      string                  `json:"toolset_hash,omitempty"`
+	Provider         string                  `json:"provider,omitempty"`
+	ElapsedMS        int64                   `json:"elapsed_ms,omitempty"`
+	FirstByteMS      int64                   `json:"first_byte_ms,omitempty"`
+	FirstEventMS     int64                   `json:"first_event_ms,omitempty"`
+	FirstContentMS   int64                   `json:"first_content_ms,omitempty"`
+	Attempts         int                     `json:"attempts,omitempty"`
+	HTTPStatus       int                     `json:"http_status,omitempty"`
+	ErrorClass       string                  `json:"error_class,omitempty"`
+	TimeoutPhase     string                  `json:"timeout_phase,omitempty"`
+	Request          entity.ChatRequest      `json:"request"`
+	Response         entity.ChatResponse     `json:"response,omitempty"`
+	RequestShape     entity.LLMRequestShape  `json:"request_shape,omitempty"`
+	ToolProtocol     ToolProtocolAudit       `json:"tool_protocol,omitempty"`
+	RecoveryStrategy string                  `json:"recovery_strategy,omitempty"`
+	Error            string                  `json:"error,omitempty"`
+	Compaction       *ContextCompactionAudit `json:"compaction,omitempty"`
 }
 
 // ToolProtocolAudit holds only bounded, non-sensitive information about a

@@ -97,6 +97,7 @@ func sanitizeAuditRecord(record usecase.LLMAuditRecord, mode AuditContentMode) u
 	}
 	record.Request.Messages = redactConversation(record.Request.Messages)
 	record.Response.Content = redactText(record.Response.Content)
+	record.Response.ToolCalls = cloneToolCalls(record.Response.ToolCalls)
 	for i := range record.Response.ToolCalls {
 		record.Response.ToolCalls[i].Arguments = redactText(record.Response.ToolCalls[i].Arguments)
 	}
@@ -108,10 +109,20 @@ func redactConversation(conversation entity.Conversation) entity.Conversation {
 	copy(result, conversation)
 	for i := range result {
 		result[i].Content = redactText(result[i].Content)
+		result[i].ToolCalls = cloneToolCalls(result[i].ToolCalls)
 		for j := range result[i].ToolCalls {
 			result[i].ToolCalls[j].Arguments = redactText(result[i].ToolCalls[j].Arguments)
 		}
 	}
+	return result
+}
+
+func cloneToolCalls(calls []entity.ToolCall) []entity.ToolCall {
+	if calls == nil {
+		return nil
+	}
+	result := make([]entity.ToolCall, len(calls))
+	copy(result, calls)
 	return result
 }
 

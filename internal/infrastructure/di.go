@@ -27,6 +27,7 @@ type Graph struct {
 	Plugins     []entity.Plugin
 	Audit       usecase.LLMAuditSink
 	RunUsecase  *usecase.RunUsecase
+	Workspace   string
 }
 
 // Build 通过 Load() 读环境变量，然后手工接线每个组件。刻意不使用
@@ -59,6 +60,7 @@ func BuildWithConfig(cfg Config) (*Graph, error) {
 	if err != nil {
 		return nil, fmt.Errorf("di: 获取工作区: %w", err)
 	}
+	g.Workspace = workspace
 	plugins, err := buildPlugins(g.PluginState, g.EventBus, workspace)
 	if err != nil {
 		return nil, err
@@ -122,16 +124,30 @@ func (g *Graph) NewAgent(_ context.Context, opts ...entity.Option) *entity.Agent
 	}
 	merged := mergeTools(pluginTools)
 
+	systemPrompt := g.Prompt.Content
+	if g.Config.Agent.IncludeWorkingDirectory {
+		// Pi preserves the source prompt's trailing newline, then joins sections
+		// with two newlines. Prompt.Resolve trims that newline, so three newlines
+		// reproduce Pi's exact wire text for this controlled comparison.
+		systemPrompt += "\n\n\n<cwd>\n" + g.Workspace + "\n</cwd>"
+	}
 	base := []entity.Option{
 		entity.WithConfig(entity.Config{
 			Name:            g.Config.Agent.Name,
-			SystemPrompt:    g.Prompt.Content,
+			SystemPrompt:    systemPrompt,
 			Model:           g.Config.LLM.Model,
 			Temperature:     g.Config.Agent.Temperature,
 			OmitTemperature: g.Config.Agent.OmitTemperature,
 			MaxTokens:       g.Config.Agent.MaxTokens,
 			MaxIterations:   g.Config.Agent.MaxIterations,
 			Timeout:         g.Config.Agent.Timeout,
+			ContextCompaction: entity.ContextCompactionConfig{
+				ContextWindowTokens: g.Config.Agent.ContextWindowTokens,
+				ReserveTokens:       g.Config.Agent.ContextReserveTokens,
+				KeepRecentTokens:    g.Config.Agent.ContextKeepRecentTokens,
+				SummaryMaxTokens:    g.Config.Agent.ContextSummaryMaxTokens,
+				ToolResultMaxChars:  g.Config.Agent.ContextToolResultMaxChars,
+			},
 		}),
 		entity.WithLLM(g.LLM),
 		entity.WithMemory(g.Memory),
@@ -226,8 +242,9 @@ func newCompatibleProvider(name string, cfg Config, defaultBaseURL string, requi
 		requireAPIKey,
 		nil,
 		adapter.OpenAICompatibleOptions{
-			ContinueWithToolsAfterToolCall: name != "lmstudio",
+			ContinueWithToolsAfterToolCall: true,
 			MaxTokensField:                 cfg.LLM.MaxTokensField,
+			UserContentParts:               cfg.LLM.UserContentFormat == "parts",
 			RequestExtra:                   requestExtra,
 		},
 	)

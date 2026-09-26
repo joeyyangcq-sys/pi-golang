@@ -22,9 +22,9 @@ type fakeLLM struct {
 	err       error // 非 nil 时第一次调用返回该错误
 }
 
-type lmStudioFake struct{ *fakeLLM }
+type noToolContinuationFake struct{ *fakeLLM }
 
-func (lmStudioFake) ContinueWithToolsAfterToolCall() bool { return false }
+func (noToolContinuationFake) ContinueWithToolsAfterToolCall() bool { return false }
 
 type recordingAuditSink struct {
 	records []usecase.LLMAuditRecord
@@ -104,6 +104,100 @@ func TestExecute_WritesStructuredLLMFailureAudit(t *testing.T) {
 	if record.Phase != "error" || record.Provider != "lmstudio" || record.ErrorClass != string(entity.LLMErrorTimeout) || record.TimeoutPhase != "response_headers" || record.Attempts != 1 {
 		t.Fatalf("结构化错误审计错误: %+v", record)
 	}
+}
+
+func TestExecute_CompactsPriorSessionHistory(t *testing.T) {
+	first := strings.Repeat("a", 160)
+	llm := &fakeLLM{responses: []entity.ChatResponse{
+		{Content: strings.Repeat("b", 160)},
+		{Content: "user asked for a coding change; first answer completed the inspection"},
+		{Content: "second answer"},
+	}}
+	agent := entity.NewAgent(
+		entity.WithLLM(llm),
+		entity.WithConfig(entity.Config{
+			SystemPrompt:  "s",
+			MaxIterations: 1,
+			ContextCompaction: entity.ContextCompactionConfig{
+				ContextWindowTokens: 80,
+				ReserveTokens:       20,
+				KeepRecentTokens:    20,
+				SummaryMaxTokens:    32,
+				ToolResultMaxChars:  32,
+			},
+		}),
+	)
+	uc := usecase.NewRunUsecase(nil)
+	if _, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: first}); err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	out, err := uc.Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "continue with the implementation"})
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if out.Compactions != 1 {
+		t.Fatalf("Compactions = %d, want 1", out.Compactions)
+	}
+	calls := llm.callsSnapshot()
+	if len(calls) != 3 {
+		t.Fatalf("LLM call count = %d, want 3 (run, summary, run)", len(calls))
+	}
+	if len(calls[1].Tools) != 0 || !strings.Contains(calls[1].Messages[0].Content, "Do not issue tool calls") {
+		t.Fatalf("summary request should be isolated and tool-free: %+v", calls[1])
+	}
+	lastText := messagesText(calls[2].Messages)
+	if strings.Contains(lastText, first) {
+		t.Fatalf("compacted request retained old raw history: %+v", calls[2].Messages)
+	}
+	if !strings.Contains(lastText, "Previous conversation summary") || !strings.Contains(lastText, "continue with the implementation") {
+		t.Fatalf("compacted request missing summary or recent prompt: %+v", calls[2].Messages)
+	}
+	state := agent.ConversationSession().State()
+	if len(state.Messages) != 4 || state.CompactedUntil != 2 || state.Summary == "" {
+		t.Fatalf("session should retain raw history plus summary: %+v", state)
+	}
+}
+
+func TestExecute_ContextOverflowCompactsAndRetriesOnce(t *testing.T) {
+	session := entity.NewConversationSession()
+	session.Append(entity.User(strings.Repeat("old user ", 30)))
+	session.Append(entity.Assistant(strings.Repeat("old answer ", 30)))
+	llm := &fakeLLM{
+		err: errors.New("maximum context length exceeded"),
+		responses: []entity.ChatResponse{
+			{Content: "old goal and completed work"},
+			{Content: "recovered answer"},
+		},
+	}
+	agent := entity.NewAgent(
+		entity.WithLLM(llm),
+		entity.WithConversationSession(session),
+		entity.WithConfig(entity.Config{
+			MaxIterations: 1,
+			ContextCompaction: entity.ContextCompactionConfig{
+				ContextWindowTokens: 1000, ReserveTokens: 200, KeepRecentTokens: 50,
+				SummaryMaxTokens: 32, ToolResultMaxChars: 32,
+			},
+		}),
+	)
+	out, err := usecase.NewRunUsecase(nil).Execute(context.Background(), agent, usecase.RunInput{UserPrompt: "continue"})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if out.FinalAnswer != "recovered answer" || out.Compactions != 1 || out.Iterations != 1 {
+		t.Fatalf("overflow recovery result = %+v", out)
+	}
+	if got := len(llm.callsSnapshot()); got != 3 {
+		t.Fatalf("LLM call count = %d, want failed request + summary + retry", got)
+	}
+}
+
+func messagesText(messages entity.Conversation) string {
+	parts := make([]string, 0, len(messages))
+	for _, message := range messages {
+		parts = append(parts, message.Content)
+	}
+	return strings.Join(parts, "\n")
 }
 
 // errTool 总是返回错误结果。
@@ -549,8 +643,8 @@ func hasToolHistory(messages entity.Conversation) bool {
 	return false
 }
 
-func TestExecute_LMStudioToolContinuationOmitsTools(t *testing.T) {
-	llm := lmStudioFake{&fakeLLM{model: "m", responses: []entity.ChatResponse{
+func TestExecute_ProviderWithoutToolContinuationOmitsTools(t *testing.T) {
+	llm := noToolContinuationFake{&fakeLLM{model: "m", responses: []entity.ChatResponse{
 		{ToolCalls: []entity.ToolCall{{ID: "call-1", Name: "ok", Arguments: `{}`}}},
 		{Content: "done"},
 	}}}
@@ -560,7 +654,7 @@ func TestExecute_LMStudioToolContinuationOmitsTools(t *testing.T) {
 	}
 	calls := llm.callsSnapshot()
 	if len(calls) != 2 || len(calls[0].Tools) != 1 || len(calls[1].Tools) != 0 {
-		t.Fatalf("LM Studio tool continuation 请求错误: %+v", calls)
+		t.Fatalf("no-tool continuation 请求错误: %+v", calls)
 	}
 }
 

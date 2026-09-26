@@ -25,17 +25,26 @@ type LLMConfig struct {
 	// intended for documented compatibility controls such as a thinking switch.
 	// It remains text here so LLMConfig can still be compared in callers.
 	RequestExtraJSON string
+	// UserContentFormat controls the OpenAI-compatible user message envelope.
+	// Supported values are text (default) and parts.
+	UserContentFormat string
 }
 
 // AgentConfig 持有 Agent 相关配置。
 type AgentConfig struct {
-	Name            string
-	SystemPrompt    string
-	Temperature     float64
-	OmitTemperature bool
-	MaxTokens       int
-	MaxIterations   int
-	Timeout         time.Duration
+	Name                      string
+	SystemPrompt              string
+	Temperature               float64
+	OmitTemperature           bool
+	MaxTokens                 int
+	MaxIterations             int
+	Timeout                   time.Duration
+	ContextWindowTokens       int
+	ContextReserveTokens      int
+	ContextKeepRecentTokens   int
+	ContextSummaryMaxTokens   int
+	ContextToolResultMaxChars int
+	IncludeWorkingDirectory   bool
 }
 
 // LogConfig 控制日志器。
@@ -100,21 +109,28 @@ func Load() (Config, error) {
 	}
 	cfg := Config{
 		LLM: LLMConfig{
-			Provider:         provider,
-			APIKey:           apiKey,
-			BaseURL:          baseURL,
-			Model:            model,
-			MaxTokensField:   env("LLM_MAX_TOKENS_FIELD", ""),
-			RequestExtraJSON: requestExtra,
+			Provider:          provider,
+			APIKey:            apiKey,
+			BaseURL:           baseURL,
+			Model:             model,
+			MaxTokensField:    env("LLM_MAX_TOKENS_FIELD", ""),
+			RequestExtraJSON:  requestExtra,
+			UserContentFormat: env("LLM_USER_CONTENT_FORMAT", "text"),
 		},
 		Agent: AgentConfig{
-			Name:            env("AGENT_NAME", "pi-agent"),
-			SystemPrompt:    env("AGENT_SYSTEM_PROMPT", ""),
-			Temperature:     envFloat("AGENT_TEMPERATURE", 0.7),
-			OmitTemperature: envBool("AGENT_OMIT_TEMPERATURE", false),
-			MaxTokens:       envInt("AGENT_MAX_TOKENS", 0),
-			MaxIterations:   envInt("AGENT_MAX_ITERATIONS", 5),
-			Timeout:         envDuration("AGENT_TIMEOUT", 0),
+			Name:                      env("AGENT_NAME", "pi-agent"),
+			SystemPrompt:              env("AGENT_SYSTEM_PROMPT", ""),
+			Temperature:               envFloat("AGENT_TEMPERATURE", 0.7),
+			OmitTemperature:           envBool("AGENT_OMIT_TEMPERATURE", false),
+			MaxTokens:                 envInt("AGENT_MAX_TOKENS", 0),
+			MaxIterations:             envInt("AGENT_MAX_ITERATIONS", 5),
+			Timeout:                   envDuration("AGENT_TIMEOUT", 0),
+			ContextWindowTokens:       envInt("AGENT_CONTEXT_WINDOW", 0),
+			ContextReserveTokens:      envInt("AGENT_CONTEXT_RESERVE_TOKENS", 16384),
+			ContextKeepRecentTokens:   envInt("AGENT_CONTEXT_KEEP_RECENT_TOKENS", 20000),
+			ContextSummaryMaxTokens:   envInt("AGENT_CONTEXT_SUMMARY_MAX_TOKENS", 2048),
+			ContextToolResultMaxChars: envInt("AGENT_CONTEXT_TOOL_RESULT_MAX_CHARS", 2000),
+			IncludeWorkingDirectory:   envBool("AGENT_INCLUDE_WORKING_DIRECTORY", false),
 		},
 		Log: LogConfig{
 			Level: env("LOG_LEVEL", "info"),
@@ -199,6 +215,9 @@ func (c Config) Validate() error {
 			return errors.New("config: LLM_REQUEST_EXTRA_JSON 必须是 JSON object")
 		}
 	}
+	if c.LLM.UserContentFormat != "" && c.LLM.UserContentFormat != "text" && c.LLM.UserContentFormat != "parts" {
+		return errors.New("config: LLM_USER_CONTENT_FORMAT 必须是 text 或 parts")
+	}
 	if c.Agent.MaxIterations < 1 {
 		return errors.New("config: AGENT_MAX_ITERATIONS 必须 >= 1")
 	}
@@ -207,6 +226,27 @@ func (c Config) Validate() error {
 	}
 	if c.Agent.Timeout < 0 {
 		return errors.New("config: AGENT_TIMEOUT 必须 >= 0")
+	}
+	if c.Agent.ContextWindowTokens < 0 {
+		return errors.New("config: AGENT_CONTEXT_WINDOW 必须 >= 0")
+	}
+	if c.Agent.ContextWindowTokens > 0 {
+		if c.Agent.ContextReserveTokens <= 0 || c.Agent.ContextReserveTokens >= c.Agent.ContextWindowTokens {
+			return errors.New("config: AGENT_CONTEXT_RESERVE_TOKENS 必须大于 0 且小于 AGENT_CONTEXT_WINDOW")
+		}
+		if c.Agent.ContextKeepRecentTokens <= 0 {
+			return errors.New("config: AGENT_CONTEXT_KEEP_RECENT_TOKENS 必须 > 0")
+		}
+		if c.Agent.ContextSummaryMaxTokens <= 0 {
+			return errors.New("config: AGENT_CONTEXT_SUMMARY_MAX_TOKENS 必须 > 0")
+		}
+		usable := c.Agent.ContextWindowTokens - c.Agent.ContextReserveTokens
+		if c.Agent.ContextKeepRecentTokens+c.Agent.ContextSummaryMaxTokens >= usable {
+			return errors.New("config: AGENT_CONTEXT_KEEP_RECENT_TOKENS 加 AGENT_CONTEXT_SUMMARY_MAX_TOKENS 必须小于可用上下文窗口")
+		}
+		if c.Agent.ContextToolResultMaxChars <= 0 {
+			return errors.New("config: AGENT_CONTEXT_TOOL_RESULT_MAX_CHARS 必须 > 0")
+		}
 	}
 	if c.Audit.ContentMode != string(AuditContentRedacted) && c.Audit.ContentMode != string(AuditContentFull) {
 		return errors.New("config: AUDIT_CONTENT_MODE 必须是 redacted 或 full")

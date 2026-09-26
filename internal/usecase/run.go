@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"time"
 
 	"pi-golang/internal/entity"
@@ -86,6 +87,9 @@ type RunOutput struct {
 	Usage entity.TokenUsage
 	// UsageReported 表示至少一轮 provider 返回了非零 token usage。
 	UsageReported bool
+	// Compactions records summaries generated to fit the configured model
+	// context budget. Their token usage is included in Usage.
+	Compactions int
 }
 
 // RunUsecase 封装“运行 Agent 一次”用例的依赖。
@@ -241,13 +245,16 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		prompt = in.UserPrompt
 	}
 
-	// 构造第一版对话。Conversation 是后续循环的唯一事实来源：每轮模型响应
-	// 和工具结果都会 append 到这里，而不是另起一份“临时历史”。
-	conv := entity.Conversation{}
-	if cfg.SystemPrompt != "" {
-		conv = conv.Append(entity.System(cfg.SystemPrompt))
+	// 会话保存所有非 system 消息；每次请求再投影为 system prompt、已有摘要
+	// 和尚未压缩的原始后缀。这样同一个 Agent 连续 Execute 时可延续上下文，
+	// 同时又不会因压缩丢掉可导出的完整历史。
+	session := a.ConversationSession()
+	if session == nil {
+		session = entity.NewConversationSession()
 	}
-	conv = conv.Append(entity.User(prompt))
+	session.Append(entity.User(prompt))
+	conv := session.Snapshot().Project(cfg.SystemPrompt)
+	conversationBeforeHooks := append(entity.Conversation(nil), conv...)
 
 	// ================================================================
 	// ④ ConversationBuilt — 初始对话（system+user）构造完成
@@ -271,6 +278,16 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		convInfo = modified
 	}
 	conv = convInfo.Conversation
+	// A common ConversationBuilt extension pattern appends retrieved history or
+	// a project checkpoint. Preserve that suffix in the durable session so a
+	// compaction during this run, or the next Execute call, does not silently
+	// lose it. Arbitrary replacement remains a one-run projection by design:
+	// the hook owns its source of truth in that case.
+	if hasConversationPrefix(conv, conversationBeforeHooks) {
+		for _, message := range conv[len(conversationBeforeHooks):] {
+			session.Append(message)
+		}
+	}
 
 	uc.Logger.Info(ctx, "开始 agent 运行", "agent", cfg.Name,
 		"iterations", cfg.MaxIterations, "tools", len(a.Tools()), "plugins", len(plugins))
@@ -296,6 +313,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		}
 	}
 	cleanToolFallbackUsed := false
+	overflowRecoveryUsed := false
 
 	for i := 0; i < cfg.MaxIterations; i++ {
 		out.Iterations = i + 1
@@ -338,6 +356,24 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: ctx.Err()})
 			return out, ctx.Err()
 		default:
+		}
+
+		// Context compaction happens immediately before a primary model request.
+		// It only summarizes already-recorded history and has no tools, so it
+		// cannot cause a completed tool action to run again.
+		compactedConv, compactionUsage, compacted, compactErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, false)
+		if compactErr != nil {
+			a.SetState(entity.AgentError)
+			uc.publishError(bus, ctx, "context.compaction", compactErr)
+			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: compactErr})
+			return out, compactErr
+		}
+		if compacted {
+			conv = compactedConv
+			out.Compactions++
+			addUsage(&out, compactionUsage)
+			uc.Logger.Info(ctx, "上下文已压缩", "iteration", i+1, "compactions", out.Compactions,
+				"estimated_input_tokens", estimateConversationTokens(conv))
 		}
 
 		// ============================================================
@@ -413,24 +449,31 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 				RequestShape:   failure.RequestShape,
 				Error:          lerr.Error(),
 			}))
+			// Pi-style overflow recovery: after a provider rejects this request
+			// for context length, compact once and retry the *model request*.
+			// This branch runs before any tool dispatch, so it never replays a
+			// side effect. A second overflow surfaces normally.
+			if !overflowRecoveryUsed && cfg.ContextCompaction.Enabled() && isContextOverflowError(lerr) {
+				recoveredConv, recoveryUsage, recovered, recoveryErr := uc.maybeCompact(ctx, a, model, runID, i+1, auditMeta, true)
+				if recoveryErr == nil && recovered {
+					overflowRecoveryUsed = true
+					conv = recoveredConv
+					out.Compactions++
+					addUsage(&out, recoveryUsage)
+					uc.Logger.Warn(ctx, "模型上下文溢出，已压缩并重试一次", "iteration", i+1)
+					i-- // the recovery retry is not an additional tool-loop iteration
+					continue
+				}
+				if recoveryErr != nil {
+					lerr = fmt.Errorf("%w; context recovery: %v", lerr, recoveryErr)
+				}
+			}
 			a.SetState(entity.AgentError)
 			uc.publishError(bus, ctx, "llm.chat", lerr)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{Iterations: i + 1, Err: lerr})
 			return out, fmt.Errorf("usecase: 第 %d 轮: llm: %w", i+1, lerr)
 		}
-		out.Usage.Input += resp.Usage.Input
-		out.Usage.Output += resp.Usage.Output
-		out.Usage.Reasoning += resp.Usage.Reasoning
-		out.Usage.CacheRead += resp.Usage.CacheRead
-		out.Usage.CacheWrite += resp.Usage.CacheWrite
-		if resp.Usage.Total > 0 {
-			out.Usage.Total += resp.Usage.Total
-		} else {
-			out.Usage.Total += resp.Usage.Input + resp.Usage.Output
-		}
-		if resp.Usage.Input > 0 || resp.Usage.Output > 0 || resp.Usage.Total > 0 {
-			out.UsageReported = true
-		}
+		addUsage(&out, resp.Usage)
 		uc.Logger.Debug(ctx, "llm 回复", "iter", i+1,
 			"tool_calls", len(resp.ToolCalls), "content_len", len(resp.Content),
 			"input_tokens", resp.Usage.Input, "output_tokens", resp.Usage.Output,
@@ -500,6 +543,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 				faInfo = modified
 			}
 			out.FinalAnswer = faInfo.Answer
+			session.Append(entity.Assistant(resp.Content))
 			a.SetState(entity.AgentDone)
 			uc.runTurnEnd(plugins, bus, ctx, a, entity.TurnEndInfo{
 				FinalAnswer: out.FinalAnswer, Iterations: i + 1, Err: nil,
@@ -547,6 +591,7 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 		// 保留 ToolCalls（尤其是 ID）：OpenAI 兼容 provider 下一轮必须把
 		// 这条 assistant 消息与对应 tool reply 一起发送回服务端。
 		conv = conv.Append(entity.AssistantWithToolCalls(resp.Content, resp.ToolCalls))
+		session.Append(entity.AssistantWithToolCalls(resp.Content, resp.ToolCalls))
 
 		// ============================================================
 		// 工具阶段 — 遍历每个 ToolCall
@@ -572,7 +617,11 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 					ArgumentsSchemaValid: true,
 				}),
 			}))
+			before := len(conv)
 			conv = uc.dispatchTool(ctx, a, plugins, bus, tools, tc, conv)
+			for _, message := range conv[before:] {
+				session.Append(message)
+			}
 		}
 		if !continueWithToolsAfterToolCall(a.LLM()) {
 			// LM Studio documented tool loop: retain the tool exchange in
@@ -942,6 +991,37 @@ func (uc *RunUsecase) writeAudit(ctx context.Context, record LLMAuditRecord) {
 		uc.Logger.Error(ctx, "LLM 审计写入失败", "run_id", record.RunID,
 			"iteration", record.Iteration, "phase", record.Phase, "err", err)
 	}
+}
+
+// addUsage aggregates both primary requests and compaction summary requests.
+// Providers may omit Total, in which case Input+Output is the best available
+// comparable figure.
+func addUsage(out *RunOutput, usage entity.TokenUsage) {
+	out.Usage.Input += usage.Input
+	out.Usage.Output += usage.Output
+	out.Usage.Reasoning += usage.Reasoning
+	out.Usage.CacheRead += usage.CacheRead
+	out.Usage.CacheWrite += usage.CacheWrite
+	if usage.Total > 0 {
+		out.Usage.Total += usage.Total
+	} else {
+		out.Usage.Total += usage.Input + usage.Output
+	}
+	if usage.Input > 0 || usage.Output > 0 || usage.Total > 0 {
+		out.UsageReported = true
+	}
+}
+
+func hasConversationPrefix(conversation, prefix entity.Conversation) bool {
+	if len(conversation) < len(prefix) {
+		return false
+	}
+	for i := range prefix {
+		if !reflect.DeepEqual(conversation[i], prefix[i]) {
+			return false
+		}
+	}
+	return true
 }
 
 const maxToolCallArgumentsBytes = 1 << 20

@@ -50,7 +50,33 @@ type Config struct {
 	MaxIterations int
 	// Timeout 为 0 表示由调用方 context 决定；大于 0 时覆盖整次运行。
 	Timeout time.Duration
+	// ContextCompaction controls automatic history compaction. A zero
+	// ContextWindowTokens leaves compaction disabled so existing callers retain
+	// their current request shape.
+	ContextCompaction ContextCompactionConfig
 }
+
+// ContextCompactionConfig defines the model-context budget used to replace an
+// old prefix with a durable summary. Token estimates are deliberately
+// conservative and provider independent; providers that expose an exact
+// tokenizer can be added behind this policy later without changing sessions.
+type ContextCompactionConfig struct {
+	// ContextWindowTokens is the model input window. Zero disables compaction.
+	ContextWindowTokens int
+	// ReserveTokens leaves room for the model response and provider overhead.
+	ReserveTokens int
+	// KeepRecentTokens is the approximate budget retained verbatim after a
+	// compaction. The older prefix is represented by Summary.
+	KeepRecentTokens int
+	// SummaryMaxTokens limits the compaction model call.
+	SummaryMaxTokens int
+	// ToolResultMaxChars bounds a single tool result in the summarizer input.
+	// The original tool result remains in the durable raw session history.
+	ToolResultMaxChars int
+}
+
+// Enabled reports whether this config has an explicit context window.
+func (c ContextCompactionConfig) Enabled() bool { return c.ContextWindowTokens > 0 }
 
 // Option 是传给 Agent 构造器的功能选项。
 type Option func(*Agent)
@@ -78,6 +104,17 @@ func WithLLM(l LLM) Option {
 // WithMemory 把 Memory 后端接入 Agent。
 func WithMemory(m Memory) Option {
 	return func(a *Agent) { a.memory = m }
+}
+
+// WithConversationSession supplies the durable history for repeated Execute
+// calls. Callers can persist SessionState externally and restore it into a new
+// Agent process without coupling the core entity to a storage backend.
+func WithConversationSession(s *ConversationSession) Option {
+	return func(a *Agent) {
+		if s != nil {
+			a.session = s
+		}
+	}
 }
 
 // WithTools 替换 Agent 可调用的工具列表。
@@ -114,6 +151,7 @@ type Agent struct {
 	state       AgentState
 	llm         LLM
 	memory      Memory
+	session     *ConversationSession
 	tools       []Tool
 	pluginState PluginStateStore
 	plugins     []Plugin
@@ -128,7 +166,8 @@ func NewAgent(opts ...Option) *Agent {
 			Temperature:   0.7,
 			MaxIterations: 5,
 		},
-		state: AgentIdle,
+		state:   AgentIdle,
+		session: NewConversationSession(),
 	}
 	for _, opt := range opts {
 		opt(a)
@@ -150,6 +189,11 @@ func (a *Agent) LLM() LLM { return a.llm }
 
 // Memory 返回 Memory 后端，可能为 nil。
 func (a *Agent) Memory() Memory { return a.memory }
+
+// ConversationSession returns the Agent's history and compaction state. It is
+// safe to snapshot or persist while the Agent is idle; Execute serializes its
+// own updates through the session's mutex.
+func (a *Agent) ConversationSession() *ConversationSession { return a.session }
 
 // PluginState 返回插件命名空间状态存储，可能为 nil（需要状态的钩子
 // 应在 nil 时优雅降级或返回描述性错误）。

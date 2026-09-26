@@ -69,6 +69,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	var noTools bool
 	var toolsMode string
 	var taskProfile string
+	var sessionFile string
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
@@ -81,6 +82,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	fs.BoolVar(&noTools, "no-tools", false, "本次运行不向 LLM 注册工具（适合纯文本/HTML 生成任务）")
 	fs.StringVar(&toolsMode, "tools", "auto", "工具模式：auto（默认）、enabled、disabled")
 	fs.StringVar(&taskProfile, "task-profile", "auto", "任务 profile：auto、generation、agent-readonly、agent-mutation")
+	fs.StringVar(&sessionFile, "session", "", "会话状态 JSON 文件；重复使用以延续历史并启用跨进程压缩")
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
@@ -132,6 +134,14 @@ func cmdRun(ctx context.Context, args []string) int {
 		return 2
 	}
 	var agentOptions []entity.Option
+	if strings.TrimSpace(sessionFile) != "" {
+		session, loadErr := infrastructure.LoadConversationSession(sessionFile)
+		if loadErr != nil {
+			fmt.Fprintln(os.Stderr, "加载会话:", loadErr)
+			return 1
+		}
+		agentOptions = append(agentOptions, entity.WithConversationSession(session))
+	}
 	if !toolsEnabled {
 		agentOptions = append(agentOptions, entity.WithTools(nil))
 	}
@@ -161,6 +171,13 @@ func cmdRun(ctx context.Context, args []string) int {
 		ToolsMode:     resolvedToolsMode(toolsMode, toolsEnabled),
 		PromptVersion: g.Prompt.Version,
 	})
+	if strings.TrimSpace(sessionFile) != "" {
+		if saveErr := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); saveErr != nil {
+			g.Logger.Error(ctx, "保存会话失败", "path", sessionFile, "err", saveErr)
+			_, _ = fmt.Fprintln(os.Stdout, "session save failed:", saveErr)
+			return 1
+		}
+	}
 	if err != nil {
 		g.Logger.Error(ctx, "运行失败", "err", err)
 		_, _ = fmt.Fprintln(os.Stdout, "run failed:", err)
@@ -177,6 +194,7 @@ func cmdRun(ctx context.Context, args []string) int {
 		"output", out.Usage.Output, "reasoning", out.Usage.Reasoning,
 		"cache_read", out.Usage.CacheRead, "cache_write", out.Usage.CacheWrite,
 		"total", out.Usage.Total, "quality", usageQuality)
+	_, _ = fmt.Fprintln(os.Stdout, "compactions:", out.Compactions)
 	_, _ = fmt.Fprintln(os.Stdout, "answer:")
 	_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
 	if strings.TrimSpace(outputFile) != "" {
@@ -448,6 +466,7 @@ Usage:
   LLM_API_KEY          所选 provider 的 API key           (默认: 空)
   LLM_BASE_URL         覆盖端点 base URL                  (默认: provider 默认)
   LLM_MODEL            使用的模型 id                       (默认: provider 默认)
+  LLM_USER_CONTENT_FORMAT text | parts 用户消息格式          (默认: text)
   LM_API_TOKEN         LM Studio 开启认证时的 API token
   AGENT_NAME           agent 名称                         (默认: pi-agent)
   AGENT_SYSTEM_PROMPT  最先注入的系统提示                   (默认: 空)
@@ -455,6 +474,12 @@ Usage:
   AGENT_MAX_TOKENS     单次模型输出 token 上限               (默认: provider)
   AGENT_MAX_ITERATIONS 每次运行最大工具调用循环数           (默认: 5)
   AGENT_TIMEOUT        整次 Agent 预算，例如 10m、1h              (默认: context)
+  AGENT_CONTEXT_WINDOW 模型上下文窗口 token 数；0 时不压缩       (默认: 0)
+  AGENT_CONTEXT_RESERVE_TOKENS 为输出和协议预留的 token 数       (默认: 16384)
+  AGENT_CONTEXT_KEEP_RECENT_TOKENS 压缩后保留原文的 token 数     (默认: 20000)
+  AGENT_CONTEXT_SUMMARY_MAX_TOKENS 压缩摘要的输出 token 上限     (默认: 2048)
+  AGENT_CONTEXT_TOOL_RESULT_MAX_CHARS 摘要输入中单条工具结果上限 (默认: 2000)
+  AGENT_INCLUDE_WORKING_DIRECTORY 在系统提示中加入 Pi 同形 cwd section (默认: false)
   LOG_LEVEL            debug | info | warn | error        (默认: info)
   AUDIT_LOG_FILE        JSONL 审计文件路径；为空时不启用
   AUDIT_CONTENT_MODE    redacted | full（默认: redacted）
@@ -474,6 +499,7 @@ run flags:
 	  --tools auto|enabled|disabled                 auto 会为 HTML/纯文本生成关闭工具；可显式覆盖。
 	  --task-profile auto|generation|agent-readonly|agent-mutation
 	                                               generation 可在畸形 tool call 时安全降级；写入任务不会自动重试。
+	  --session path                              跨进程保存会话历史和摘要状态。
 	  --no-tools                                   --tools=disabled 的兼容别名。
   API key 优先级：--api-key > LLM_API_KEY > provider 专属环境变量。
 `

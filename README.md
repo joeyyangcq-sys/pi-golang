@@ -198,6 +198,40 @@ AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run
 如需确认实际注册内容，可用 `--debug` 查看 `tools=4`，或把
 `LOG_LEVEL=debug` 打开观察每轮的工具调用、参数摘要和结果。
 
+### 长会话上下文压缩
+
+为模型显式设置上下文窗口后，Agent 会在输入接近 `window - reserve` 时把较早
+历史摘要化，保留最近原文消息与完整的 tool-call/tool-result 配对。原始消息不从
+session 删除；摘要输入仅截断过长 tool result。模型返回 context overflow 时，Agent
+最多压缩一次并只重试尚未执行工具的模型请求。
+
+```bash
+AGENT_CONTEXT_WINDOW=114688 \
+AGENT_CONTEXT_RESERVE_TOKENS=16384 \
+AGENT_CONTEXT_KEEP_RECENT_TOKENS=20000 \
+go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' \
+  --model '已加载的模型 ID' --session ./.pi-agent/session.json \
+  --prompt '继续实现并测试前面的修改'
+```
+
+`--session` 会以 owner-only 权限原子保存完整历史和当前摘要；重复使用同一路径才会
+跨 CLI 进程延续上下文。`AGENT_CONTEXT_KEEP_RECENT_TOKENS` 加
+`AGENT_CONTEXT_SUMMARY_MAX_TOKENS` 必须小于 `AGENT_CONTEXT_WINDOW - AGENT_CONTEXT_RESERVE_TOKENS`。
+
+### Go / Pi 请求形态 2×2 验证
+
+固定 seed 后，可用独立 runner 验证 `<cwd>` system section 与 user content block
+对 reasoning 的主效应和交互项：
+
+```bash
+python3 scripts/benchmark_request_shape_2x2.py --runs 3 \
+  --base-url http://127.0.0.1:1234/v1 \
+  --model qwen3.6-35b-a3b-heretic-splash
+```
+
+默认输出到 `artifacts/comparison/request-shape-2x2/`。完整实验门槛和判定规则见
+`doc/request-shape-2x2-validation.md`。
+
 排错顺序：先确认 `--debug` 的 model 和 prompt 元数据符合预期；再看
 `LOG_LEVEL=debug` 的 `llm 回复` 记录；最后检查返回的 HTTP 状态。缺少
 有效 API key 或 `LLM_MODEL` 时会得到明确的本地错误，不会发出网络请求。
@@ -205,7 +239,8 @@ AGENT_SYSTEM_PROMPT='始终使用中文，回答不超过三句。' go run . run
 ## LLM 输入输出审计
 
 设置 `AUDIT_LOG_FILE` 或传入 `--audit-file` 后，Agent 会为**每轮**模型
-调用写入五类 JSONL 事件：`request`、`response`、`error`、`tool_validation`、`tool_dispatch`。它们共用 `run_id`
+调用写入 JSONL 事件：`request`、`response`、`error`、`compaction_request`、
+`compaction_response`、`compaction_error`、`tool_validation`、`tool_dispatch`。它们共用 `run_id`
 和 `iteration`，请求事件包含最终发给模型的完整 messages（含系统提示词），
 响应事件包含原始 provider 输出、工具调用与 token 用量。
 

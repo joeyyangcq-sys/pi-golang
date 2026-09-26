@@ -21,7 +21,7 @@
 - 三个 HTTP adapter 现在都使用共享 SSE transport；OpenAI-compatible 仍保留普通 JSON fallback，Anthropic/Gemini 使用各自原生流事件。
 - OpenAI-compatible 请求支持 `AGENT_OMIT_TEMPERATURE`、`AGENT_MAX_TOKENS`、`LLM_MAX_TOKENS_FIELD` 与受控的 `LLM_REQUEST_EXTRA_JSON`。实际等价性仍应以 wire 审计验证，不能从配置名称推断。
 - CLI 的 `auto` 工具模式已不再依赖 prompt 关键词或 `--output` 推断权限；需要纯生成能力时必须显式使用 `--tools=disabled` 和合适的 task profile。
-- [工具续轮策略](../internal/usecase/run.go)对 LM Studio 在一次工具调用后移除后续请求的 tools。需要验证其在多轮 coding 中的实际效果及适用边界。
+- [CWD 泛化验证](../artifacts/comparison/cwd-generalization/report.md)确认：LM Studio 在首次工具结果后移除 `tools` 会让 coding 任务停在读取阶段；Pi 的有效续轮持续携带工具。pi-golang 已改为保留工具，coding 对照 9/9 通过。
 
 长 reasoning 与某个字段之间的因果关系目前未知。先采集最终 HTTP 请求，再做单因素实验。
 
@@ -74,7 +74,7 @@ Provider adapter：字段映射、HTTP/SSE 解析、超时与协议诊断
 ### P2：保证通用工具循环正确
 
 - 用契约用例验证：一次回答、多轮只读工具、多轮读写工具、工具报错回传、工具参数不合法、模型中途断流、用户取消。
-- ✅ LM Studio “调用工具后不再发送 tools”已改为 `OpenAICompatibleOptions` 的显式、可测试 provider capability；旧构造器仅保留兼容默认值。
+- ✅ 有效工具结果续轮继续发送 `tools`，支持 coding 的读取、修改和验证循环；不支持该能力的兼容端点仍可通过 `OpenAICompatibleOptions` 显式关闭。
 - 仅在整批工具调用组装完成并验证后执行。已产生副作用的工具不得因网络超时自动重放；恢复应使用已有会话与工具结果，或明确失败。
 - 整次任务预算覆盖所有模型轮次与工具调用；每轮、每工具可有独立上限，并把终止原因写入审计。
 

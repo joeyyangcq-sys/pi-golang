@@ -141,6 +141,12 @@ func (p *auditProxy) ServeHTTP(response http.ResponseWriter, request *http.Reque
 }
 
 func runnerPath(path string) (runner, upstreamPath string, ok bool) {
+	if strings.HasPrefix(path, "/go-") || strings.HasPrefix(path, "/pi-") {
+		parts := strings.SplitN(strings.TrimPrefix(path, "/"), "/", 2)
+		if len(parts) == 2 && parts[0] != "" {
+			return parts[0], "/" + parts[1], true
+		}
+	}
 	for _, candidate := range []string{"go", "pi"} {
 		prefix := "/" + candidate
 		if path == prefix {

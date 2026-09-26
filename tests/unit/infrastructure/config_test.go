@@ -37,12 +37,26 @@ func TestLoad_ParsesOpenAICompatibleRequestProfile(t *testing.T) {
 	t.Setenv("AGENT_OMIT_TEMPERATURE", "true")
 	t.Setenv("LLM_MAX_TOKENS_FIELD", "max_completion_tokens")
 	t.Setenv("LLM_REQUEST_EXTRA_JSON", `{"chat_template_kwargs":{"enable_thinking":false}}`)
+	t.Setenv("LLM_USER_CONTENT_FORMAT", "parts")
+	t.Setenv("AGENT_INCLUDE_WORKING_DIRECTORY", "true")
 	cfg, err := infrastructure.Load()
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
 	}
-	if !cfg.Agent.OmitTemperature || cfg.LLM.MaxTokensField != "max_completion_tokens" || cfg.LLM.RequestExtraJSON == "" {
+	if !cfg.Agent.OmitTemperature || cfg.LLM.MaxTokensField != "max_completion_tokens" || cfg.LLM.RequestExtraJSON == "" ||
+		cfg.LLM.UserContentFormat != "parts" || !cfg.Agent.IncludeWorkingDirectory {
 		t.Fatalf("request profile = %+v", cfg)
+	}
+}
+
+func TestConfig_RejectsUnknownUserContentFormat(t *testing.T) {
+	cfg := infrastructure.Config{
+		LLM:   infrastructure.LLMConfig{UserContentFormat: "blocks"},
+		Agent: infrastructure.AgentConfig{MaxIterations: 1},
+		Audit: infrastructure.AuditConfig{ContentMode: "redacted"},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("unknown user content format should be rejected")
 	}
 }
 
@@ -54,6 +68,27 @@ func TestConfig_RejectsNegativeAgentBudget(t *testing.T) {
 	cfg = infrastructure.Config{Agent: infrastructure.AgentConfig{Timeout: -time.Second}}
 	if err := cfg.Validate(); err == nil {
 		t.Fatal("negative Timeout should be rejected")
+	}
+}
+
+func TestConfig_ValidatesContextCompactionBudget(t *testing.T) {
+	cfg := infrastructure.Config{
+		Agent: infrastructure.AgentConfig{
+			MaxIterations:             1,
+			ContextWindowTokens:       32768,
+			ContextReserveTokens:      16384,
+			ContextKeepRecentTokens:   12000,
+			ContextSummaryMaxTokens:   2048,
+			ContextToolResultMaxChars: 2000,
+		},
+		Audit: infrastructure.AuditConfig{ContentMode: "redacted"},
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("valid context budget rejected: %v", err)
+	}
+	cfg.Agent.ContextKeepRecentTokens = 15000
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("context budget that cannot fit summary and retained history should be rejected")
 	}
 }
 

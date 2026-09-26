@@ -118,6 +118,51 @@ func TestOpenAIProvider_RequestOverridesPreserveCoreFields(t *testing.T) {
 	}
 }
 
+func TestOpenAIProvider_UserContentParts(t *testing.T) {
+	var wire map[string]any
+	client := &http.Client{Transport: roundTripperFunc(func(request *http.Request) (*http.Response, error) {
+		if err := json.NewDecoder(request.Body).Decode(&wire); err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"application/json"}},
+			Body:       io.NopCloser(strings.NewReader(`{"choices":[{"message":{"role":"assistant","content":"ok"}}],"usage":{}}`)),
+		}, nil
+	})}
+	provider := adapter.NewOpenAICompatibleWithOptions(
+		"lmstudio", "", "http://example.test/v1", "model", false, client,
+		adapter.OpenAICompatibleOptions{UserContentParts: true},
+	)
+	_, err := provider.Chat(context.Background(), entity.ChatRequest{
+		Model: "model",
+		Messages: entity.Conversation{
+			entity.System("system"),
+			entity.User("hello"),
+		},
+	})
+	if err != nil {
+		t.Fatalf("Chat() error = %v", err)
+	}
+	messages, ok := wire["messages"].([]any)
+	if !ok || len(messages) != 2 {
+		t.Fatalf("messages = %#v", wire["messages"])
+	}
+	system := messages[0].(map[string]any)
+	user := messages[1].(map[string]any)
+	if system["content"] != "system" {
+		t.Fatalf("system content should remain text: %#v", system)
+	}
+	parts, ok := user["content"].([]any)
+	if !ok || len(parts) != 1 {
+		t.Fatalf("user content parts = %#v", user["content"])
+	}
+	part := parts[0].(map[string]any)
+	if part["type"] != "text" || part["text"] != "hello" {
+		t.Fatalf("user content part = %#v", part)
+	}
+}
+
 func TestOpenAIProvider_ChatReportsConfigurationAndHTTPFailures(t *testing.T) {
 	provider := adapter.NewOpenAI("", "https://example.invalid/v1", "test-model")
 	if _, err := provider.Chat(context.Background(), entity.ChatRequest{Model: "test-model"}); err == nil || !strings.Contains(err.Error(), "API key") {
@@ -358,8 +403,8 @@ func TestOpenAIProvider_ChatOmitsEmptyAssistantContentForToolCall(t *testing.T) 
 	if err != nil {
 		t.Fatalf("Chat() error = %v", err)
 	}
-	if provider.ContinueWithToolsAfterToolCall() {
-		t.Fatal("lmstudio 工具结果续轮必须移除 tools")
+	if !provider.ContinueWithToolsAfterToolCall() {
+		t.Fatal("lmstudio coding 续轮必须保留 tools")
 	}
 }
 
@@ -373,7 +418,7 @@ func TestOpenAIProvider_ChatReportsToolContinuationRequestShape(t *testing.T) {
 			t.Fatalf("解码请求: %v", err)
 		}
 		if len(request.Tools) != 0 {
-			t.Fatalf("续轮不应包含 tools: %+v", request)
+			t.Fatalf("调用方未提供 tools 时请求不应自行添加: %+v", request)
 		}
 		_, _ = w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"done"}}]}`))
 	}))

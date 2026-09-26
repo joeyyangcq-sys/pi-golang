@@ -49,6 +49,38 @@ func TestFileAuditSink_RedactsContentByDefault(t *testing.T) {
 	}
 }
 
+func TestFileAuditSink_RedactionDoesNotMutateRecord(t *testing.T) {
+	path := t.TempDir() + "/audit/llm.jsonl"
+	sink, err := infrastructure.NewFileAuditSink(path, infrastructure.AuditContentRedacted)
+	if err != nil {
+		t.Fatalf("NewFileAuditSink() error = %v", err)
+	}
+	defer func() { _ = sink.Close() }()
+
+	requestArguments := `{"path":"before.py"}`
+	responseArguments := `{"path":"after.py"}`
+	record := usecase.LLMAuditRecord{
+		Request: entity.ChatRequest{Messages: entity.Conversation{
+			entity.AssistantWithToolCalls("", []entity.ToolCall{{
+				ID: "request-call", Name: "read_file", Arguments: requestArguments,
+			}}),
+		}},
+		Response: entity.ChatResponse{ToolCalls: []entity.ToolCall{{
+			ID: "response-call", Name: "write_file", Arguments: responseArguments,
+		}}},
+	}
+	if err := sink.WriteLLM(context.Background(), record); err != nil {
+		t.Fatalf("WriteLLM() error = %v", err)
+	}
+
+	if got := record.Request.Messages[0].ToolCalls[0].Arguments; got != requestArguments {
+		t.Fatalf("request arguments mutated = %q, want %q", got, requestArguments)
+	}
+	if got := record.Response.ToolCalls[0].Arguments; got != responseArguments {
+		t.Fatalf("response arguments mutated = %q, want %q", got, responseArguments)
+	}
+}
+
 func TestFileAuditSink_FullContent(t *testing.T) {
 	path := t.TempDir() + "/llm.jsonl"
 	sink, err := infrastructure.NewFileAuditSink(path, infrastructure.AuditContentFull)
