@@ -29,7 +29,7 @@ func TestExecutePlan_UsesFreshConversationForEveryPlannedTask(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecutePlan() error = %v", err)
 	}
-	if !out.Completed || out.FinalAnswer != "feature shipped" || len(out.Plan.Tasks) != 2 || len(out.Runs) != 4 {
+	if !out.Completed || out.FinalAnswer != "feature shipped" || len(out.Plan.Tasks) != 2 || len(out.Runs) != 4 || out.Conversations != 4 {
 		t.Fatalf("ExecutePlan() output = %+v", out)
 	}
 	wantRoles := []usecase.OrchestrationRole{
@@ -92,7 +92,9 @@ func TestExecutePlan_RejectsCyclicPlanThenRequestsCorrection(t *testing.T) {
 		{Content: `VERIFICATION_RESULT: {"status":"pass","summary":"ok","evidence":["A"],"failures":[],"repair_tasks":[],"final_answer":"done"}`},
 	}}
 
+	factoryCalls := 0
 	out, err := usecase.NewRunUsecase(nil).ExecutePlan(context.Background(), func(_ usecase.OrchestrationRole) *entity.Agent {
+		factoryCalls++
 		return newAgentWith(llm, nil, nil, nil)
 	}, usecase.PlanExecutionInput{
 		Run: usecase.RunInput{UserPrompt: "work"}, MaxTasks: 4,
@@ -101,11 +103,15 @@ func TestExecutePlan_RejectsCyclicPlanThenRequestsCorrection(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ExecutePlan() error = %v", err)
 	}
-	if !out.Completed || len(out.Runs) != 4 {
+	if !out.Completed || len(out.Runs) != 4 || out.Conversations != 3 || factoryCalls != 3 {
 		t.Fatalf("corrected plan output = %+v", out)
 	}
 	calls := llm.callsSnapshot()
-	if !strings.Contains(calls[1].Messages[0].Content, "cycle") {
-		t.Fatalf("planner retry did not explain rejection: %s", calls[1].Messages[0].Content)
+	secondPlannerCall := calls[1].Messages
+	if len(secondPlannerCall) < 3 || !strings.Contains(secondPlannerCall[len(secondPlannerCall)-1].Content, "cycle") {
+		t.Fatalf("planner retry did not continue the same conversation with rejection context: %+v", secondPlannerCall)
+	}
+	if out.Runs[0].ConversationID == "" || out.Runs[0].ConversationID != out.Runs[1].ConversationID {
+		t.Fatalf("planner protocol retries used different conversations: %+v", out.Runs[:2])
 	}
 }

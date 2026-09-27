@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 )
@@ -29,6 +30,15 @@ func (nop) Error(context.Context, string, ...any) {}
 // DefaultSlog 返回一个由 log/slog 支撑的 Logger，向 stderr 输出 JSON，
 // 级别由 level 指定（debug | info | warn | error），默认 info。
 func DefaultSlog(level string) Logger {
+	return DefaultSlogTo(level, os.Stderr)
+}
+
+// DefaultSlogTo is the stream-injectable variant used by CLI adapters and
+// tests. Keeping the old DefaultSlog signature preserves existing callers.
+func DefaultSlogTo(level string, output io.Writer) Logger {
+	if output == nil {
+		output = io.Discard
+	}
 	var lvl slog.Level
 	switch level {
 	case "debug", "DEBUG":
@@ -40,7 +50,7 @@ func DefaultSlog(level string) Logger {
 	default:
 		lvl = slog.LevelInfo
 	}
-	h := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	h := slog.NewJSONHandler(output, &slog.HandlerOptions{Level: lvl})
 	return slogLogger{slog.New(h)}
 }
 

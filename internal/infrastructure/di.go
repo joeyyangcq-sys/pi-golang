@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 
 	"pi-golang/internal/adapter"
@@ -43,6 +44,16 @@ func Build() (*Graph, error) {
 // BuildWithConfig 用已经解析且可能被 CLI 覆盖的配置组装依赖图。
 // 它让 CLI 不需要修改全局环境变量，也方便集成测试注入固定配置。
 func BuildWithConfig(cfg Config) (*Graph, error) {
+	return buildWithConfig(cfg, nil)
+}
+
+// BuildWithConfigAndOutput is the stream-injectable CLI variant. Runtime
+// diagnostics stay on Err while command results remain on the caller's Out.
+func BuildWithConfigAndOutput(cfg Config, logOutput io.Writer) (*Graph, error) {
+	return buildWithConfig(cfg, logOutput)
+}
+
+func buildWithConfig(cfg Config, logOutput io.Writer) (*Graph, error) {
 	if err := cfg.Validate(); err != nil {
 		return nil, fmt.Errorf("di: 校验配置: %w", err)
 	}
@@ -51,7 +62,11 @@ func BuildWithConfig(cfg Config) (*Graph, error) {
 		Prompt: prompt.Resolve(cfg.Agent.SystemPrompt),
 	}
 
-	g.Logger = NewLogger(cfg.Log.Level)
+	if logOutput == nil {
+		g.Logger = NewLogger(cfg.Log.Level)
+	} else {
+		g.Logger = NewLoggerWithOutput(cfg.Log.Level, logOutput)
+	}
 	g.LLM = buildLLM(cfg)
 	g.Memory = NewInMemoryMemory()
 	g.EventBus = NewInMemoryEventBus()

@@ -1,12 +1,33 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"strings"
 	"testing"
 
 	"pi-golang/internal/entity"
 	"pi-golang/internal/usecase"
 )
+
+func TestRealMain_UsesInjectedStreams(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := realMain([]string{"version"}, Streams{
+		In:  strings.NewReader(""),
+		Out: &stdout,
+		Err: &stderr,
+	})
+
+	if code != 0 {
+		t.Fatalf("realMain() code = %d, want 0", code)
+	}
+	if got := stdout.String(); got != "pi-agent 0.1.0 (minimal)\n" {
+		t.Fatalf("stdout = %q", got)
+	}
+	if stderr.Len() != 0 {
+		t.Fatalf("stderr = %q, want empty", stderr.String())
+	}
+}
 
 func TestResolveToolsMode(t *testing.T) {
 	tests := []struct {

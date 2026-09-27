@@ -19,15 +19,32 @@ import (
 	"pi-golang/internal/usecase"
 )
 
+// Streams keeps process I/O explicit so command execution can be tested
+// without replacing global stdout/stderr. Production main wires these to the
+// process streams; protocol drivers can provide their own sinks later.
+type Streams struct {
+	In  io.Reader
+	Out io.Writer
+	Err io.Writer
+}
+
 func main() {
+	os.Exit(realMain(os.Args[1:], Streams{
+		In:  os.Stdin,
+		Out: os.Stdout,
+		Err: os.Stderr,
+	}))
+}
+
+func realMain(args []string, streams Streams) int {
+	streams = withDefaultStreams(streams)
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	args := os.Args[1:]
 	if len(args) == 0 {
 		// 终端中直接运行 `go run .` 时进入持续对话；管道或脚本场景
 		// 保留原有的一次性默认行为，避免无界等待 stdin。
-		if isInteractive(os.Stdin) {
+		if isInteractiveReader(streams.In) {
 			args = []string{"run", "--interactive"}
 		} else {
 			args = []string{"run"}
@@ -36,35 +53,47 @@ func main() {
 
 	switch args[0] {
 	case "version", "-v", "--version":
-		fmt.Println("pi-agent 0.1.0 (minimal)")
-		return
+		fmt.Fprintln(streams.Out, "pi-agent 0.1.0 (minimal)")
+		return 0
 	case "providers":
-		fmt.Println(strings.Join(infrastructure.SupportedProviders(), "\n"))
-		return
+		fmt.Fprintln(streams.Out, strings.Join(infrastructure.SupportedProviders(), "\n"))
+		return 0
 	case "setup":
-		code := cmdSetup()
-		if code != 0 {
-			os.Exit(code)
-		}
-		return
+		return cmdSetup(streams)
 	case "help", "-h", "--help":
-		fmt.Print(strings.TrimSpace(helpText) + "\n")
-		return
+		fmt.Fprint(streams.Out, strings.TrimSpace(helpText)+"\n")
+		return 0
 	case "run":
-		code := cmdRun(ctx, args[1:])
-		if code != 0 {
-			os.Exit(code)
-		}
-		return
+		return cmdRun(ctx, args[1:], streams)
 	default:
-		fmt.Fprintln(os.Stderr, "未知命令:", args[0])
-		fmt.Fprintln(os.Stderr, "运行 `pi-agent help` 查看用法")
-		os.Exit(2)
+		fmt.Fprintln(streams.Err, "未知命令:", args[0])
+		fmt.Fprintln(streams.Err, "运行 `pi-agent help` 查看用法")
+		return 2
 	}
 }
 
-func cmdRun(ctx context.Context, args []string) int {
+func withDefaultStreams(streams Streams) Streams {
+	if streams.In == nil {
+		streams.In = os.Stdin
+	}
+	if streams.Out == nil {
+		streams.Out = os.Stdout
+	}
+	if streams.Err == nil {
+		streams.Err = os.Stderr
+	}
+	return streams
+}
+
+func isInteractiveReader(input io.Reader) bool {
+	file, ok := input.(*os.File)
+	return ok && isInteractive(file)
+}
+
+func cmdRun(ctx context.Context, args []string, streams Streams) int {
+	streams = withDefaultStreams(streams)
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
+	fs.SetOutput(streams.Err)
 	var prompt string
 	var interactive bool
 	var debug bool
@@ -108,60 +137,60 @@ func cmdRun(ctx context.Context, args []string) int {
 	}
 	orchestration = strings.ToLower(strings.TrimSpace(orchestration))
 	interactiveMode := interactive
-	if !interactiveMode && prompt == "" && isInteractive(os.Stdin) {
+	if !interactiveMode && prompt == "" && isInteractiveReader(streams.In) {
 		interactiveMode = true
 	}
 	if interactiveMode {
 		if orchestration != "single" {
-			fmt.Fprintln(os.Stderr, "参数错误: --interactive 只能与 --orchestration=single 一起使用")
+			fmt.Fprintln(streams.Err, "参数错误: --interactive 只能与 --orchestration=single 一起使用")
 			return 2
 		}
 		if strings.TrimSpace(outputFile) != "" {
-			fmt.Fprintln(os.Stderr, "参数错误: --output 不能用于多轮对话，请使用单次 --prompt 模式")
+			fmt.Fprintln(streams.Err, "参数错误: --output 不能用于多轮对话，请使用单次 --prompt 模式")
 			return 2
 		}
 	} else if prompt == "" {
 		prompt = "hello"
 	}
 	if orchestration != "single" && orchestration != "plan" {
-		fmt.Fprintln(os.Stderr, "参数错误: --orchestration 必须是 single 或 plan")
+		fmt.Fprintln(streams.Err, "参数错误: --orchestration 必须是 single 或 plan")
 		return 2
 	}
 	if maxPlanTasks < 1 || maxPlanTasks > 100 {
-		fmt.Fprintln(os.Stderr, "参数错误: --max-plan-tasks 必须在 1 到 100 之间")
+		fmt.Fprintln(streams.Err, "参数错误: --max-plan-tasks 必须在 1 到 100 之间")
 		return 2
 	}
 	if protocolAttempts < 1 || protocolAttempts > 10 {
-		fmt.Fprintln(os.Stderr, "参数错误: --protocol-attempts 必须在 1 到 10 之间")
+		fmt.Fprintln(streams.Err, "参数错误: --protocol-attempts 必须在 1 到 10 之间")
 		return 2
 	}
 	if workerAttempts < 1 || workerAttempts > 10 {
-		fmt.Fprintln(os.Stderr, "参数错误: --worker-attempts 必须在 1 到 10 之间")
+		fmt.Fprintln(streams.Err, "参数错误: --worker-attempts 必须在 1 到 10 之间")
 		return 2
 	}
 	if maxReplans < 0 || maxReplans > 10 {
-		fmt.Fprintln(os.Stderr, "参数错误: --max-replans 必须在 0 到 10 之间")
+		fmt.Fprintln(streams.Err, "参数错误: --max-replans 必须在 0 到 10 之间")
 		return 2
 	}
 	if orchestration == "plan" && strings.TrimSpace(sessionFile) != "" {
-		fmt.Fprintln(os.Stderr, "参数错误: plan 模式为每个角色创建独立会话，不能同时使用 --session")
+		fmt.Fprintln(streams.Err, "参数错误: plan 模式为每个角色创建独立会话，不能同时使用 --session")
 		return 2
 	}
 
 	cfg, err := infrastructure.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "加载配置:", err)
+		fmt.Fprintln(streams.Err, "加载配置:", err)
 		return 1
 	}
 	cfg = cfg.WithLLMOverrides(provider, apiKey, baseURL, model)
 	if cfg.NeedsLLMSetup() {
-		if !isInteractive(os.Stdin) {
-			printSetupHint(cfg)
+		if !isInteractiveReader(streams.In) {
+			printSetupHint(cfg, streams.Err)
 			return 1
 		}
-		cfg, err = setupLLMInteractively(cfg, os.Stdin, os.Stderr)
+		cfg, err = setupLLMInteractively(cfg, streams.In, streams.Err)
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "配置 LLM:", err)
+			fmt.Fprintln(streams.Err, "配置 LLM:", err)
 			return 1
 		}
 	}
@@ -171,31 +200,31 @@ func cmdRun(ctx context.Context, args []string) int {
 		ctx, cancel = context.WithTimeout(ctx, cfg.Agent.Timeout)
 		defer cancel()
 	}
-	g, err := infrastructure.BuildWithConfig(cfg)
+	g, err := infrastructure.BuildWithConfigAndOutput(cfg, streams.Err)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "启动:", err)
+		fmt.Fprintln(streams.Err, "启动:", err)
 		return 1
 	}
 	defer func() {
 		if closeErr := g.Close(); closeErr != nil {
-			fmt.Fprintln(os.Stderr, "关闭审计日志:", closeErr)
+			fmt.Fprintln(streams.Err, "关闭审计日志:", closeErr)
 		}
 	}()
 	toolsEnabled, err := resolveToolsMode(toolsMode, noTools, outputFile, prompt)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "参数错误:", err)
+		fmt.Fprintln(streams.Err, "参数错误:", err)
 		return 2
 	}
 	profile, err := resolveTaskProfile(taskProfile, outputFile, prompt)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "参数错误:", err)
+		fmt.Fprintln(streams.Err, "参数错误:", err)
 		return 2
 	}
 	var agentOptions []entity.Option
 	if strings.TrimSpace(sessionFile) != "" {
 		session, loadErr := infrastructure.LoadConversationSession(sessionFile)
 		if loadErr != nil {
-			fmt.Fprintln(os.Stderr, "加载会话:", loadErr)
+			fmt.Fprintln(streams.Err, "加载会话:", loadErr)
 			return 1
 		}
 		agentOptions = append(agentOptions, entity.WithConversationSession(session))
@@ -207,23 +236,23 @@ func cmdRun(ctx context.Context, args []string) int {
 	if debug {
 		// Debug 输出写 stderr，避免与最终 answer 的 stdout 混在一起，便于
 		// 脚本只采集回答。提示词可能含业务上下文，生产环境请谨慎开启。
-		fmt.Fprintf(os.Stderr, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
+		fmt.Fprintf(streams.Err, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
 			g.Prompt.ID, g.Prompt.Version, g.Prompt.Hash, len(g.Prompt.Content))
-		fmt.Fprintf(os.Stderr, "debug: model=%q provider=%q base_url=%q max_tokens=%d max_iterations=%d timeout=%s tools=%d tools_mode=%s\n",
+		fmt.Fprintf(streams.Err, "debug: model=%q provider=%q base_url=%q max_tokens=%d max_iterations=%d timeout=%s tools=%d tools_mode=%s\n",
 			agent.Config().Model, g.Config.LLM.Provider, g.Config.LLM.BaseURL, agent.Config().MaxTokens, agent.Config().MaxIterations, agent.Config().Timeout, len(agent.Tools()), toolsMode)
 		for _, tool := range agent.Tools() {
 			info := tool.Info()
-			_, _ = fmt.Fprintf(os.Stderr, "debug: tool name=%q description=%q schema=%s\n",
+			_, _ = fmt.Fprintf(streams.Err, "debug: tool name=%q description=%q schema=%s\n",
 				info.Name, info.Description, string(info.InputSchema))
 		}
-		fmt.Fprintln(os.Stderr, "debug: system prompt follows")
-		fmt.Fprintln(os.Stderr, g.Prompt.Content)
+		fmt.Fprintln(streams.Err, "debug: system prompt follows")
+		fmt.Fprintln(streams.Err, g.Prompt.Content)
 	}
 	g.Logger.Info(ctx, "已构建 agent", "name", agent.Config().Name,
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
 		"plugins", len(agent.Plugins()), "tools", len(agent.Tools()))
 	if interactiveMode {
-		return runInteractive(ctx, g, agent, profile, resolvedToolsMode(toolsMode, toolsEnabled), sessionFile)
+		return runInteractive(ctx, g, agent, profile, resolvedToolsMode(toolsMode, toolsEnabled), sessionFile, streams)
 	}
 
 	runInput := usecase.RunInput{
@@ -240,7 +269,8 @@ func cmdRun(ctx context.Context, args []string) int {
 	var compactions int
 	var completed bool
 	var stopReason usecase.RunStopReason
-	var agentRuns int
+	var conversations int
+	var agentTurns int
 	var planTasks int
 	var replans int
 	var orchestrationID string
@@ -255,7 +285,8 @@ func cmdRun(ctx context.Context, args []string) int {
 		compactions = out.Compactions
 		stopReason = out.StopReason
 		completed = out.StopReason == usecase.RunStopFinalAnswer
-		agentRuns = 1
+		conversations = 1
+		agentTurns = 1
 	} else {
 		allTools := agent.Tools()
 		factory := func(role usecase.OrchestrationRole) *entity.Agent {
@@ -275,7 +306,8 @@ func cmdRun(ctx context.Context, args []string) int {
 		usage = planned.Usage
 		compactions = planned.Compactions
 		completed = planned.Completed
-		agentRuns = len(planned.Runs)
+		conversations = planned.Conversations
+		agentTurns = len(planned.Runs)
 		planTasks = len(planned.Plan.Tasks)
 		replans = planned.Replans
 		orchestrationID = planned.OrchestrationID
@@ -289,46 +321,46 @@ func cmdRun(ctx context.Context, args []string) int {
 	if orchestration == "single" && strings.TrimSpace(sessionFile) != "" {
 		if saveErr := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); saveErr != nil {
 			g.Logger.Error(ctx, "保存会话失败", "path", sessionFile, "err", saveErr)
-			_, _ = fmt.Fprintln(os.Stdout, "session save failed:", saveErr)
+			_, _ = fmt.Fprintln(streams.Err, "session save failed:", saveErr)
 			return 1
 		}
 	}
 	if err != nil {
 		g.Logger.Error(ctx, "运行失败", "err", err)
-		_, _ = fmt.Fprintln(os.Stdout, "run failed:", err)
+		_, _ = fmt.Fprintln(streams.Err, "run failed:", err)
 		return 1
 	}
 
-	_, _ = fmt.Fprintln(os.Stdout, "===============")
-	_, _ = fmt.Fprintln(os.Stdout, "orchestration:", orchestration, "agent_runs:", agentRuns,
-		"plan_tasks:", planTasks, "replans:", replans, "orchestration_id:", orchestrationID,
+	_, _ = fmt.Fprintln(streams.Out, "===============")
+	_, _ = fmt.Fprintln(streams.Out, "orchestration:", orchestration, "conversations:", conversations,
+		"agent_turns:", agentTurns, "plan_tasks:", planTasks, "replans:", replans, "orchestration_id:", orchestrationID,
 		"iterations:", iterations, "elapsed:", elapsed)
 	usageQuality := "missing"
 	if usageReported {
 		usageQuality = "reported"
 	}
-	_, _ = fmt.Fprintln(os.Stdout, "usage:", "input", usage.Input,
+	_, _ = fmt.Fprintln(streams.Out, "usage:", "input", usage.Input,
 		"output", usage.Output, "reasoning", usage.Reasoning,
 		"cache_read", usage.CacheRead, "cache_write", usage.CacheWrite,
 		"total", usage.Total, "quality", usageQuality)
-	_, _ = fmt.Fprintln(os.Stdout, "compactions:", compactions)
-	_, _ = fmt.Fprintln(os.Stdout, "stop_reason:", stopReason, "completed:", completed)
-	_, _ = fmt.Fprintln(os.Stdout, "answer:")
-	_, _ = fmt.Fprintln(os.Stdout, finalAnswer)
+	_, _ = fmt.Fprintln(streams.Out, "compactions:", compactions)
+	_, _ = fmt.Fprintln(streams.Out, "stop_reason:", stopReason, "completed:", completed)
+	_, _ = fmt.Fprintln(streams.Out, "answer:")
+	_, _ = fmt.Fprintln(streams.Out, finalAnswer)
 	if !completed {
 		g.Logger.Error(ctx, "任务未完成", "orchestration", orchestration,
-			"agent_runs", agentRuns, "plan_tasks", planTasks, "replans", replans,
+			"conversations", conversations, "agent_turns", agentTurns, "plan_tasks", planTasks, "replans", replans,
 			"stop_reason", stopReason)
 		return 1
 	}
 	if strings.TrimSpace(outputFile) != "" {
 		if err := infrastructure.SaveHTMLArtifact(outputFile, finalAnswer); err != nil {
 			g.Logger.Error(ctx, "保存 HTML 失败", "path", outputFile, "err", err)
-			_, _ = fmt.Fprintln(os.Stdout, "html save failed:", err)
+			_, _ = fmt.Fprintln(streams.Err, "html save failed:", err)
 			return 1
 		}
 		g.Logger.Info(ctx, "已保存 HTML", "path", outputFile, "chars", len(finalAnswer))
-		_, _ = fmt.Fprintln(os.Stdout, "html:", outputFile)
+		_, _ = fmt.Fprintln(streams.Out, "html:", outputFile)
 	}
 	return 0
 }
@@ -344,21 +376,23 @@ func runInteractive(
 	profile entity.TaskProfile,
 	toolsMode string,
 	sessionFile string,
+	streams Streams,
 ) int {
-	reader := bufio.NewReader(os.Stdin)
-	_, _ = fmt.Fprintln(os.Stdout, "进入多轮对话模式。输入 /help 查看命令，输入 /exit 或 Ctrl-D 退出。")
+	streams = withDefaultStreams(streams)
+	reader := bufio.NewReader(streams.In)
+	_, _ = fmt.Fprintln(streams.Out, "进入多轮对话模式。输入 /help 查看命令，输入 /exit 或 Ctrl-D 退出。")
 
 	for {
-		_, _ = fmt.Fprint(os.Stdout, "pi> ")
+		_, _ = fmt.Fprint(streams.Out, "pi> ")
 		line, readErr := reader.ReadString('\n')
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
-			fmt.Fprintln(os.Stderr, "读取输入:", readErr)
+			fmt.Fprintln(streams.Err, "读取输入:", readErr)
 			return 1
 		}
 		prompt := strings.TrimSpace(line)
 		if prompt == "" {
 			if errors.Is(readErr, io.EOF) {
-				_, _ = fmt.Fprintln(os.Stdout)
+				_, _ = fmt.Fprintln(streams.Out)
 				return 0
 			}
 			continue
@@ -366,10 +400,10 @@ func runInteractive(
 
 		switch strings.ToLower(prompt) {
 		case "/exit", "/quit":
-			_, _ = fmt.Fprintln(os.Stdout, "再见。")
+			_, _ = fmt.Fprintln(streams.Out, "再见。")
 			return 0
 		case "/help":
-			_, _ = fmt.Fprintln(os.Stdout, "命令：/help 查看帮助，/reset 清空当前对话，/exit 退出。")
+			_, _ = fmt.Fprintln(streams.Out, "命令：/help 查看帮助，/reset 清空当前对话，/exit 退出。")
 			if errors.Is(readErr, io.EOF) {
 				return 0
 			}
@@ -378,11 +412,11 @@ func runInteractive(
 			agent.ResetConversationSession()
 			if strings.TrimSpace(sessionFile) != "" {
 				if err := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); err != nil {
-					fmt.Fprintln(os.Stderr, "保存会话:", err)
+					fmt.Fprintln(streams.Err, "保存会话:", err)
 					return 1
 				}
 			}
-			_, _ = fmt.Fprintln(os.Stdout, "当前对话已清空。")
+			_, _ = fmt.Fprintln(streams.Out, "当前对话已清空。")
 			if errors.Is(readErr, io.EOF) {
 				return 0
 			}
@@ -404,19 +438,19 @@ func runInteractive(
 
 		if strings.TrimSpace(sessionFile) != "" {
 			if saveErr := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); saveErr != nil {
-				fmt.Fprintln(os.Stderr, "保存会话:", saveErr)
+				fmt.Fprintln(streams.Err, "保存会话:", saveErr)
 				return 1
 			}
 		}
 		if err != nil {
-			fmt.Fprintln(os.Stderr, "运行失败:", err)
+			fmt.Fprintln(streams.Err, "运行失败:", err)
 			if ctx.Err() != nil {
 				return 1
 			}
 		} else {
-			_, _ = fmt.Fprintln(os.Stdout, "assistant:")
-			_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
-			_, _ = fmt.Fprintf(os.Stdout, "[iterations=%d elapsed=%s]\n", out.Iterations, out.Elapsed.Round(time.Millisecond))
+			_, _ = fmt.Fprintln(streams.Out, "assistant:")
+			_, _ = fmt.Fprintln(streams.Out, out.FinalAnswer)
+			_, _ = fmt.Fprintf(streams.Out, "[iterations=%d elapsed=%s]\n", out.Iterations, out.Elapsed.Round(time.Millisecond))
 		}
 
 		if errors.Is(readErr, io.EOF) {
@@ -427,18 +461,19 @@ func runInteractive(
 
 // cmdSetup 显式运行首次配置向导。run 命令在发现配置不完整时也会自动
 // 进入同一个向导；单独的 setup 命令方便用户在更换 provider 或模型时重配。
-func cmdSetup() int {
-	if !isInteractive(os.Stdin) {
-		fmt.Fprintln(os.Stderr, "setup 需要交互式终端；请直接在终端运行 `go run . setup`")
+func cmdSetup(streams Streams) int {
+	streams = withDefaultStreams(streams)
+	if !isInteractiveReader(streams.In) {
+		fmt.Fprintln(streams.Err, "setup 需要交互式终端；请直接在终端运行 `go run . setup`")
 		return 2
 	}
 	cfg, err := infrastructure.Load()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "加载配置:", err)
+		fmt.Fprintln(streams.Err, "加载配置:", err)
 		return 1
 	}
-	if _, err := setupLLMInteractively(cfg, os.Stdin, os.Stderr); err != nil {
-		fmt.Fprintln(os.Stderr, "配置 LLM:", err)
+	if _, err := setupLLMInteractively(cfg, streams.In, streams.Err); err != nil {
+		fmt.Fprintln(streams.Err, "配置 LLM:", err)
 		return 1
 	}
 	return 0
@@ -450,8 +485,9 @@ func cmdSetup() int {
 // 时关闭回显。配置文件由 infrastructure.SaveLLMConfig 以 0600 权限原子写入。
 // 这是跨平台的本地文件方案；生产环境可把同一个配置接缝替换成 Keychain
 // 或 Secret Service，而不必把 secret 放进环境变量或 shell history。
-func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.Writer) (infrastructure.Config, error) {
+func setupLLMInteractively(cfg infrastructure.Config, input io.Reader, output io.Writer) (infrastructure.Config, error) {
 	reader := bufio.NewReader(input)
+	terminal, _ := input.(*os.File)
 	path, err := infrastructure.UserConfigPath()
 	if err != nil {
 		return cfg, err
@@ -499,7 +535,7 @@ func setupLLMInteractively(cfg infrastructure.Config, input *os.File, output io.
 	if providerNeedsAPIKey(provider) {
 		keyLabel = "API key（输入时不回显）"
 	}
-	enteredKey, readErr := promptSecretLine(reader, output, keyLabel, apiKey != "")
+	enteredKey, readErr := promptSecretLine(reader, terminal, output, keyLabel, apiKey != "")
 	if readErr != nil {
 		return cfg, readErr
 	}
@@ -540,20 +576,20 @@ func promptLine(reader *bufio.Reader, output io.Writer, label, defaultValue stri
 	return line, nil
 }
 
-func promptSecretLine(reader *bufio.Reader, output io.Writer, label string, hasExisting bool) (string, error) {
+func promptSecretLine(reader *bufio.Reader, terminal *os.File, output io.Writer, label string, hasExisting bool) (string, error) {
 	if hasExisting {
 		_, _ = fmt.Fprintf(output, "%s [已保存，回车保留]: ", label)
 	} else {
 		_, _ = fmt.Fprintf(output, "%s: ", label)
 	}
-	if isInteractive(os.Stdin) {
+	if terminal != nil && isInteractive(terminal) {
 		// 直接传参数，不经过 shell；stty 只负责当前终端的回显开关。
 		echoOff := exec.Command("stty", "-echo")
-		echoOff.Stdin = os.Stdin
+		echoOff.Stdin = terminal
 		if err := echoOff.Run(); err == nil {
 			defer func() {
 				echoOn := exec.Command("stty", "echo")
-				echoOn.Stdin = os.Stdin
+				echoOn.Stdin = terminal
 				_ = echoOn.Run()
 				_, _ = fmt.Fprintln(output)
 			}()
@@ -674,14 +710,14 @@ func orchestrationTools(all []entity.Tool, role usecase.OrchestrationRole) []ent
 	return filtered
 }
 
-func printSetupHint(cfg infrastructure.Config) {
+func printSetupHint(cfg infrastructure.Config, output io.Writer) {
 	path, _ := infrastructure.UserConfigPath()
-	fmt.Fprintln(os.Stderr, "当前 LLM 配置不完整，未启动网络请求。")
-	fmt.Fprintf(os.Stderr, "配置文件位置：%s\n", path)
-	fmt.Fprintln(os.Stderr, "请在交互式终端运行：go run . setup")
-	fmt.Fprintln(os.Stderr, "或显式提供：--provider、--model，以及远程 provider 的 --api-key。")
+	fmt.Fprintln(output, "当前 LLM 配置不完整，未启动网络请求。")
+	fmt.Fprintf(output, "配置文件位置：%s\n", path)
+	fmt.Fprintln(output, "请在交互式终端运行：go run . setup")
+	fmt.Fprintln(output, "或显式提供：--provider、--model，以及远程 provider 的 --api-key。")
 	if cfg.LLM.Provider == "lmstudio" {
-		fmt.Fprintln(os.Stderr, "LM Studio 示例：go run . run --provider lmstudio --base-url http://127.0.0.1:1234/v1 --model <模型名> --prompt '你好'")
+		fmt.Fprintln(output, "LM Studio 示例：go run . run --provider lmstudio --base-url http://127.0.0.1:1234/v1 --model <模型名> --prompt '你好'")
 	}
 }
 

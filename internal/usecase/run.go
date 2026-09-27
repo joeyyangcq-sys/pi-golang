@@ -71,11 +71,12 @@ type RunInput struct {
 	PromptVersion string
 	// Orchestration metadata correlates otherwise independent planner, worker,
 	// and verifier conversations in the audit stream.
-	OrchestrationID      string
-	OrchestrationRole    string
-	OrchestrationTask    string
-	OrchestrationAttempt int
-	PlanRevision         int
+	OrchestrationID           string
+	OrchestrationConversation string
+	OrchestrationRole         string
+	OrchestrationTask         string
+	OrchestrationAttempt      int
+	PlanRevision              int
 }
 
 // RunOutput 是一次 Agent 运行的结果。
@@ -323,14 +324,15 @@ func (uc *RunUsecase) Execute(ctx context.Context, a *entity.Agent, in RunInput)
 	}
 	tools := a.Tools()
 	auditMeta := runAuditMetadata{
-		PromptVersion:        in.PromptVersion,
-		TaskProfile:          string(in.TaskProfile),
-		ToolsMode:            in.ToolsMode,
-		OrchestrationID:      in.OrchestrationID,
-		OrchestrationRole:    in.OrchestrationRole,
-		OrchestrationTask:    in.OrchestrationTask,
-		OrchestrationAttempt: in.OrchestrationAttempt,
-		PlanRevision:         in.PlanRevision,
+		PromptVersion:             in.PromptVersion,
+		TaskProfile:               string(in.TaskProfile),
+		ToolsMode:                 in.ToolsMode,
+		OrchestrationID:           in.OrchestrationID,
+		OrchestrationConversation: in.OrchestrationConversation,
+		OrchestrationRole:         in.OrchestrationRole,
+		OrchestrationTask:         in.OrchestrationTask,
+		OrchestrationAttempt:      in.OrchestrationAttempt,
+		PlanRevision:              in.PlanRevision,
 	}
 	if auditMeta.TaskProfile == "" {
 		auditMeta.TaskProfile = string(entity.TaskProfileAgentMutation)
@@ -1078,15 +1080,16 @@ func hasConversationPrefix(conversation, prefix entity.Conversation) bool {
 const maxToolCallArgumentsBytes = 1 << 20
 
 type runAuditMetadata struct {
-	PromptVersion        string
-	TaskProfile          string
-	ToolsMode            string
-	ToolsetHash          string
-	OrchestrationID      string
-	OrchestrationRole    string
-	OrchestrationTask    string
-	OrchestrationAttempt int
-	PlanRevision         int
+	PromptVersion             string
+	TaskProfile               string
+	ToolsMode                 string
+	ToolsetHash               string
+	OrchestrationID           string
+	OrchestrationConversation string
+	OrchestrationRole         string
+	OrchestrationTask         string
+	OrchestrationAttempt      int
+	PlanRevision              int
 }
 
 func (m runAuditMetadata) apply(record LLMAuditRecord) LLMAuditRecord {
@@ -1095,6 +1098,7 @@ func (m runAuditMetadata) apply(record LLMAuditRecord) LLMAuditRecord {
 	record.ToolsMode = m.ToolsMode
 	record.ToolsetHash = m.ToolsetHash
 	record.OrchestrationID = m.OrchestrationID
+	record.OrchestrationConversation = m.OrchestrationConversation
 	record.OrchestrationRole = m.OrchestrationRole
 	record.OrchestrationTask = m.OrchestrationTask
 	record.OrchestrationAttempt = m.OrchestrationAttempt

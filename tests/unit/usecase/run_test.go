@@ -69,7 +69,7 @@ func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	uc := usecase.NewRunUsecase(nil, audit)
 
 	if _, err := uc.Execute(context.Background(), newAgentWith(llm, nil, nil, nil), usecase.RunInput{
-		UserPrompt: "用户输入", OrchestrationID: "orch-1", OrchestrationRole: "worker", OrchestrationTask: "task-2",
+		UserPrompt: "用户输入", OrchestrationID: "orch-1", OrchestrationConversation: "conv-1", OrchestrationRole: "worker", OrchestrationTask: "task-2",
 		OrchestrationAttempt: 2, PlanRevision: 1,
 	}); err != nil {
 		t.Fatalf("Execute() error = %v", err)
@@ -84,7 +84,7 @@ func TestExecute_WritesLLMAuditForRequestAndResponse(t *testing.T) {
 	if request.Iteration != 1 || request.Request.Messages.Last().Content != "用户输入" || response.Response.Content != "最终回答" {
 		t.Fatalf("审计输入输出错误: %+v", audit.records)
 	}
-	if request.OrchestrationID != "orch-1" || request.OrchestrationRole != "worker" || request.OrchestrationTask != "task-2" ||
+	if request.OrchestrationID != "orch-1" || request.OrchestrationConversation != "conv-1" || request.OrchestrationRole != "worker" || request.OrchestrationTask != "task-2" ||
 		request.OrchestrationAttempt != 2 || request.PlanRevision != 1 {
 		t.Fatalf("审计编排元数据错误: %+v", request)
 	}

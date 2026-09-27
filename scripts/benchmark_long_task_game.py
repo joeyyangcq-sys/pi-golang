@@ -38,7 +38,7 @@ TASK_PROMPT = """这是一个长 coding 任务。请在当前空工作区交付�
 3. 验证阶段：运行 node --check game.js，并检查 HTML 的本地资源引用；如果检查或运行中发现问题，继续修改并再次验证。
 4. 收尾阶段：回读关键文件，确认 PLAN.md 与实现一致，补充 README.md 的运行方式和操作说明。最终回答包含已完成文件、验证命令和仍存在的限制。
 
-实现质量要求：代码结构清晰，避免外部依赖；在没有图片素材时用 canvas、CSS、渐变、几何图形和文字建立深色科幻战场；游戏必须有明确的胜负/波次反馈和可操作性。每个 write/edit 工具调用只处理一个文件，避免在一个超长工具调用里写多个文件。请实际写入文件并验证，不要声称执行过没有执行的命令。"""
+实现质量要求：代码结构清晰，避免外部依赖；在没有图片素材时用 canvas、CSS、渐变、几何图形和文字建立深色科幻战场；游戏必须有明确的胜负/波次反馈和可操作性。敌人从待生成队列进入活动列表的路径必须完整；接触伤害必须有基于时间的受击冷却，不能按每个动画帧连续扣血。每个 write/edit 工具调用只处理一个文件，避免在一个超长工具调用里写多个文件。请实际写入文件并验证，不要声称执行过没有执行的命令。"""
 
 REQUIRED_FILES = ("PLAN.md", "index.html", "styles.css", "game.js", "README.md")
 
@@ -136,6 +136,14 @@ def validate_game(workspace: Path) -> Dict[str, Any]:
     for label, marker in markers.items():
         if not re.search(marker, js, re.IGNORECASE):
             issues.append(f"game_js_missing:{label}")
+    if re.search(r"spawnQueue|spawn_queue", js, re.IGNORECASE) and not re.search(
+        r"enemies\s*\.\s*(?:push|unshift)\s*\(|enemies\s*=\s*enemies\s*\.\s*concat",
+        js,
+        re.IGNORECASE,
+    ):
+        issues.append("spawn_queue_never_activates_enemies")
+    if not re.search(r"invulner|damage[_A-Za-z]*cooldown|hit[_A-Za-z]*cooldown|last[_A-Za-z]*damage|next[_A-Za-z]*damage", js, re.IGNORECASE):
+        issues.append("missing_contact_damage_cooldown")
 
     code, stdout, stderr, test_ms = common.run_command(
         ["node", "--check", "game.js"], os.environ.copy(), timeout=30, cwd=workspace
@@ -241,7 +249,9 @@ def parse_go_run(audit_path: Path, stdout: str) -> Dict[str, Any]:
             "usage": response.get("Usage") or response.get("usage") or {},
         })
     match = re.search(r"compactions:\s+(\d+)", stdout)
-    agent_runs_match = re.search(r"agent_runs:\s+(\d+)", stdout)
+    conversations_match = re.search(r"conversations:\s+(\d+)", stdout)
+    legacy_agent_runs_match = re.search(r"agent_runs:\s+(\d+)", stdout)
+    agent_turns_match = re.search(r"agent_turns:\s+(\d+)", stdout)
     plan_tasks_match = re.search(r"plan_tasks:\s+(\d+)", stdout)
     replans_match = re.search(r"replans:\s+(\d+)", stdout)
     orchestration_id_match = re.search(r"orchestration_id:\s+(\S+)", stdout)
@@ -256,7 +266,8 @@ def parse_go_run(audit_path: Path, stdout: str) -> Dict[str, Any]:
         if role == "worker" and record.get("orchestration_task"):
             worker_tasks.add(record["orchestration_task"])
     parsed.update({
-        "agent_runs": int(agent_runs_match.group(1)) if agent_runs_match else 1,
+        "conversations": int(conversations_match.group(1)) if conversations_match else int(legacy_agent_runs_match.group(1)) if legacy_agent_runs_match else 1,
+        "agent_turns": int(agent_turns_match.group(1)) if agent_turns_match else int(legacy_agent_runs_match.group(1)) if legacy_agent_runs_match else 1,
         "plan_tasks": int(plan_tasks_match.group(1)) if plan_tasks_match else 0,
         "replans": int(replans_match.group(1)) if replans_match else 0,
         "orchestration_id": orchestration_id_match.group(1) if orchestration_id_match else "",
@@ -301,15 +312,16 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         "",
         "## Runner results",
         "",
-        "| Runner | exit | task | agent runs | plan tasks | replans | tools | compactions | fallbacks | compaction phases | wall ms | input | output | reasoning |",
-        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|",
+        "| Runner | exit | task | conversations | agent turns | plan tasks | replans | tools | compactions | fallbacks | compaction phases | wall ms | input | output | reasoning |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---:|---:|---:|---:|",
     ]
     for record in records:
         usage = record.get("usage") or {}
         phases = record.get("phases") or {}
         lines.append(
             f"| {record['runner']} | {record['exit_code']} | {'pass' if record['task_success'] else 'FAIL'} | "
-            f"{record.get('agent_runs', 1)} | {record.get('plan_tasks', 0)} | {record.get('replans', 0)} | "
+            f"{record.get('conversations', 1)} | {record.get('agent_turns', record.get('conversations', 1))} | "
+            f"{record.get('plan_tasks', 0)} | {record.get('replans', 0)} | "
             f"{record.get('tool_calls', 0)} | {record.get('compaction_count', 0)} | {record.get('compaction_fallbacks', 0)} | "
             f"{phases.get('compaction_request', record.get('compaction_starts', 0))}/"
             f"{phases.get('compaction_response', record.get('compaction_ends', 0))}/"

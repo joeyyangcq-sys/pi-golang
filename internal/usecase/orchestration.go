@@ -72,13 +72,15 @@ type PlanExecutionInput struct {
 	MaxReplans       int
 }
 
-// AgentRunRecord makes every planner, worker and verifier conversation visible
-// to audit/reporting code.
+// AgentRunRecord makes every planner, worker and verifier turn visible to
+// audit/reporting code. ConversationID groups protocol retries that continue
+// in the same Agent conversation.
 type AgentRunRecord struct {
-	Role    OrchestrationRole
-	TaskID  string
-	Attempt int
-	Output  RunOutput
+	ConversationID string
+	Role           OrchestrationRole
+	TaskID         string
+	Attempt        int
+	Output         RunOutput
 }
 
 // PlanExecutionOutput is the aggregate result of plan-driven orchestration.
@@ -89,6 +91,7 @@ type PlanExecutionOutput struct {
 	Plan            ExecutionPlan
 	TaskResults     map[string]TaskResult
 	Runs            []AgentRunRecord
+	Conversations   int
 	Replans         int
 	Usage           entity.TokenUsage
 	Compactions     int
@@ -180,20 +183,24 @@ func (uc *RunUsecase) generatePlan(
 ) (ExecutionPlan, bool, string, error) {
 	prompt := plannerPrompt(in.Run.UserPrompt, in.MaxTasks)
 	lastFailure := "planner did not return a valid execution plan"
+	agent := newAgent(OrchestrationPlanner)
+	conversationID := newRunID()
+	out.Conversations++
 	for attempt := 1; attempt <= in.ProtocolAttempts; attempt++ {
 		runInput := in.Run
 		runInput.UserPrompt = prompt
 		runInput.TaskProfile = entity.TaskProfileAgentReadonly
+		runInput.OrchestrationConversation = conversationID
 		runInput.OrchestrationRole = string(OrchestrationPlanner)
 		runInput.OrchestrationAttempt = attempt
-		runOutput, err := uc.Execute(ctx, newAgent(OrchestrationPlanner), runInput)
-		recordAgentRun(out, AgentRunRecord{Role: OrchestrationPlanner, Attempt: attempt, Output: runOutput})
+		runOutput, err := uc.Execute(ctx, agent, runInput)
+		recordAgentRun(out, AgentRunRecord{ConversationID: conversationID, Role: OrchestrationPlanner, Attempt: attempt, Output: runOutput})
 		if err != nil {
 			if ctx.Err() != nil {
 				return ExecutionPlan{}, false, "", fmt.Errorf("plan execution: planner attempt %d: %w", attempt, err)
 			}
 			lastFailure = fmt.Sprintf("planner request failed: %v", err)
-			prompt = plannerRepairPrompt(in.Run.UserPrompt, in.MaxTasks, lastFailure, "")
+			prompt = plannerRetryPrompt(lastFailure)
 			continue
 		}
 		var plan ExecutionPlan
@@ -210,7 +217,7 @@ func (uc *RunUsecase) generatePlan(
 		} else {
 			lastFailure = "planner stopped with " + string(runOutput.StopReason)
 		}
-		prompt = plannerRepairPrompt(in.Run.UserPrompt, in.MaxTasks, lastFailure, runOutput.FinalAnswer)
+		prompt = plannerRetryPrompt(lastFailure)
 	}
 	return ExecutionPlan{}, false, lastFailure, nil
 }
@@ -259,22 +266,28 @@ func (uc *RunUsecase) executeTask(
 	task PlannedTask,
 ) (TaskResult, error) {
 	handoff := ""
+	prompt := workerPrompt(original, out.Plan, task, out.TaskResults, handoff)
 	lastResult := TaskResult{Status: "incomplete", Summary: "worker did not return a valid completion result"}
+	agent := newAgent(OrchestrationWorker)
+	conversationID := newRunID()
+	out.Conversations++
 	for attempt := 1; attempt <= in.WorkerAttempts; attempt++ {
 		runInput := in.Run
-		runInput.UserPrompt = workerPrompt(original, out.Plan, task, out.TaskResults, handoff)
+		runInput.UserPrompt = prompt
+		runInput.OrchestrationConversation = conversationID
 		runInput.OrchestrationRole = string(OrchestrationWorker)
 		runInput.OrchestrationTask = task.ID
 		runInput.OrchestrationAttempt = attempt
 		runInput.PlanRevision = out.Replans
-		runOutput, err := uc.Execute(ctx, newAgent(OrchestrationWorker), runInput)
-		recordAgentRun(out, AgentRunRecord{Role: OrchestrationWorker, TaskID: task.ID, Attempt: attempt, Output: runOutput})
+		runOutput, err := uc.Execute(ctx, agent, runInput)
+		recordAgentRun(out, AgentRunRecord{ConversationID: conversationID, Role: OrchestrationWorker, TaskID: task.ID, Attempt: attempt, Output: runOutput})
 		if err != nil {
 			if ctx.Err() != nil {
 				return TaskResult{}, fmt.Errorf("plan execution: task %s attempt %d: %w", task.ID, attempt, err)
 			}
 			lastResult = TaskResult{Status: "incomplete", Summary: err.Error()}
 			handoff = "Previous attempt failed: " + err.Error()
+			prompt = workerRetryPrompt(handoff)
 			continue
 		}
 		var result TaskResult
@@ -287,6 +300,7 @@ func (uc *RunUsecase) executeTask(
 			return result, nil
 		}
 		handoff = taskAttemptHandoff(runOutput, parseErr)
+		prompt = workerRetryPrompt(handoff)
 	}
 	if strings.TrimSpace(lastResult.Status) == "" || strings.EqualFold(lastResult.Status, "complete") {
 		lastResult.Status = "incomplete"
@@ -303,21 +317,25 @@ func (uc *RunUsecase) verifyPlan(
 ) (VerificationResult, bool, string, error) {
 	prompt := verifierPrompt(original, out.Plan, out.TaskResults, out.Replans, in.MaxTasks-len(out.Plan.Tasks))
 	lastFailure := "verifier did not return a valid result"
+	agent := newAgent(OrchestrationVerifier)
+	conversationID := newRunID()
+	out.Conversations++
 	for attempt := 1; attempt <= in.ProtocolAttempts; attempt++ {
 		runInput := in.Run
 		runInput.UserPrompt = prompt
 		runInput.TaskProfile = entity.TaskProfileAgentReadonly
+		runInput.OrchestrationConversation = conversationID
 		runInput.OrchestrationRole = string(OrchestrationVerifier)
 		runInput.OrchestrationAttempt = attempt
 		runInput.PlanRevision = out.Replans
-		runOutput, err := uc.Execute(ctx, newAgent(OrchestrationVerifier), runInput)
-		recordAgentRun(out, AgentRunRecord{Role: OrchestrationVerifier, Attempt: attempt, Output: runOutput})
+		runOutput, err := uc.Execute(ctx, agent, runInput)
+		recordAgentRun(out, AgentRunRecord{ConversationID: conversationID, Role: OrchestrationVerifier, Attempt: attempt, Output: runOutput})
 		if err != nil {
 			if ctx.Err() != nil {
 				return VerificationResult{}, false, "", fmt.Errorf("plan execution: verifier attempt %d: %w", attempt, err)
 			}
 			lastFailure = fmt.Sprintf("verifier request failed: %v", err)
-			prompt = verifierRetryPrompt(prompt, lastFailure, "")
+			prompt = verifierRetryPrompt(lastFailure)
 			continue
 		}
 		var result VerificationResult
@@ -340,7 +358,7 @@ func (uc *RunUsecase) verifyPlan(
 		} else {
 			lastFailure = "verifier stopped with " + string(runOutput.StopReason)
 		}
-		prompt = verifierRetryPrompt(prompt, lastFailure, runOutput.FinalAnswer)
+		prompt = verifierRetryPrompt(lastFailure)
 	}
 	return VerificationResult{}, false, lastFailure, nil
 }
@@ -360,9 +378,8 @@ Return only one JSON object with this shape:
 {"goal":"...","tasks":[{"id":"task-1","title":"...","objective":"...","dependencies":[],"acceptance_criteria":["..."]}]}`, maxTasks, original)
 }
 
-func plannerRepairPrompt(original string, maxTasks int, failure, previous string) string {
-	return fmt.Sprintf("%s\n\nYour previous plan was rejected: %s\nPrevious output:\n%s\nReturn corrected JSON only.",
-		plannerPrompt(original, maxTasks), failure, truncateOrchestrationText(previous))
+func plannerRetryPrompt(failure string) string {
+	return fmt.Sprintf("Your previous plan was rejected: %s\nContinue this conversation and return corrected JSON only.", failure)
 }
 
 func workerPrompt(original string, plan ExecutionPlan, task PlannedTask, results map[string]TaskResult, handoff string) string {
@@ -417,9 +434,13 @@ VERIFICATION_RESULT: {"status":"pass|fail","summary":"...","evidence":["..."],"f
 		remainingCapacity, original, revision, planJSON, resultsJSON)
 }
 
-func verifierRetryPrompt(base, failure, previous string) string {
-	return fmt.Sprintf("%s\n\nYour previous verifier response was rejected: %s\nPrevious output:\n%s\nReturn the required tagged JSON result.",
-		base, failure, truncateOrchestrationText(previous))
+func verifierRetryPrompt(failure string) string {
+	return fmt.Sprintf("Your previous verifier response was rejected: %s\nContinue this conversation and return the required tagged JSON result only.", failure)
+}
+
+func workerRetryPrompt(handoff string) string {
+	return fmt.Sprintf("Continue the same assigned task conversation. Correct the previous attempt using this handoff:\n%s\nFinish with the required TASK_RESULT line.",
+		truncateOrchestrationText(handoff))
 }
 
 func taskAttemptHandoff(output RunOutput, parseErr error) string {
