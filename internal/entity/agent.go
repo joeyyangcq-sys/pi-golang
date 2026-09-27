@@ -195,6 +195,17 @@ func (a *Agent) Memory() Memory { return a.memory }
 // own updates through the session's mutex.
 func (a *Agent) ConversationSession() *ConversationSession { return a.session }
 
+// ResetConversationSession starts a fresh in-memory conversation while
+// keeping the Agent's LLM, tools, plugins, and static configuration intact.
+// Interactive frontends can use it to implement a local /reset command.
+func (a *Agent) ResetConversationSession() {
+	if a == nil {
+		return
+	}
+	a.session = NewConversationSession()
+	a.state = AgentIdle
+}
+
 // PluginState 返回插件命名空间状态存储，可能为 nil（需要状态的钩子
 // 应在 nil 时优雅降级或返回描述性错误）。
 func (a *Agent) PluginState() PluginStateStore { return a.pluginState }

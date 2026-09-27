@@ -58,6 +58,21 @@ func TestConversationAppend(t *testing.T) {
 	}
 }
 
+func TestResetConversationSession(t *testing.T) {
+	a := entity.NewAgent()
+	a.ConversationSession().Append(entity.User("old prompt"))
+	a.SetState(entity.AgentDone)
+
+	a.ResetConversationSession()
+
+	if got := a.ConversationSession().State().Messages; len(got) != 0 {
+		t.Fatalf("重置后仍保留历史: %v", got)
+	}
+	if a.State() != entity.AgentIdle {
+		t.Fatalf("重置后状态 = %s, want idle", a.State())
+	}
+}
+
 type stubPlugin entity.PluginID
 
 func (s stubPlugin) ID() entity.PluginID { return entity.PluginID(s) }

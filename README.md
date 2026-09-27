@@ -73,6 +73,11 @@ export OPENAI_API_KEY='你的 API key'
 export LLM_MODEL='你的模型 ID'
 go run . run -prompt "请用一句话解释 Go interface" --debug
 
+# 在终端中直接运行即可进入多轮对话；也可以显式写 --interactive。
+# 同一个 Agent 会保留本次进程内的上下文，/reset 清空上下文，/exit 退出。
+go run .
+go run . run --interactive --session ./.pi-agent/session.json
+
 # 也可以首次运行交互式配置；配置会保存到用户配置目录，API key 不回显。
 go run . setup
 ```
@@ -237,7 +242,8 @@ go run . run --provider lmstudio --base-url 'http://127.0.0.1:1234/v1' \
 ```
 
 `--session` 会以 owner-only 权限原子保存完整历史和当前摘要；重复使用同一路径才会
-跨 CLI 进程延续上下文。`AGENT_CONTEXT_KEEP_RECENT_TOKENS` 加
+跨 CLI 进程延续上下文。在多轮模式下会在每轮回答后保存；`/reset` 会清空当前会话并
+同步覆盖 session 文件。`AGENT_CONTEXT_KEEP_RECENT_TOKENS` 加
 `AGENT_CONTEXT_SUMMARY_MAX_TOKENS` 必须小于 `AGENT_CONTEXT_WINDOW - AGENT_CONTEXT_RESERVE_TOKENS`。
 
 ### Go / Pi 请求形态 2×2 验证

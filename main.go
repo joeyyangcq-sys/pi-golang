@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,6 +12,7 @@ import (
 	"os/signal"
 	"strings"
 	"syscall"
+	"time"
 
 	"pi-golang/internal/entity"
 	"pi-golang/internal/infrastructure"
@@ -23,7 +25,13 @@ func main() {
 
 	args := os.Args[1:]
 	if len(args) == 0 {
-		args = []string{"run"}
+		// 终端中直接运行 `go run .` 时进入持续对话；管道或脚本场景
+		// 保留原有的一次性默认行为，避免无界等待 stdin。
+		if isInteractive(os.Stdin) {
+			args = []string{"run", "--interactive"}
+		} else {
+			args = []string{"run"}
+		}
 	}
 
 	switch args[0] {
@@ -58,6 +66,7 @@ func main() {
 func cmdRun(ctx context.Context, args []string) int {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	var prompt string
+	var interactive bool
 	var debug bool
 	var provider string
 	var apiKey string
@@ -76,6 +85,7 @@ func cmdRun(ctx context.Context, args []string) int {
 	var workerAttempts int
 	var maxReplans int
 	fs.StringVar(&prompt, "prompt", "", "发送给 agent 的用户 prompt")
+	fs.BoolVar(&interactive, "interactive", false, "进入持续多轮对话模式；也可直接运行 `go run .`")
 	fs.BoolVar(&debug, "debug", false, "打印本次提示词与运行配置（可能包含敏感内容）")
 	fs.StringVar(&provider, "provider", "", "本次使用的 provider，覆盖 LLM_PROVIDER")
 	fs.StringVar(&apiKey, "api-key", "", "本次使用的 API key，覆盖环境变量")
@@ -96,10 +106,23 @@ func cmdRun(ctx context.Context, args []string) int {
 	if err := fs.Parse(args); err != nil {
 		return 2
 	}
-	if prompt == "" {
+	orchestration = strings.ToLower(strings.TrimSpace(orchestration))
+	interactiveMode := interactive
+	if !interactiveMode && prompt == "" && isInteractive(os.Stdin) {
+		interactiveMode = true
+	}
+	if interactiveMode {
+		if orchestration != "single" {
+			fmt.Fprintln(os.Stderr, "参数错误: --interactive 只能与 --orchestration=single 一起使用")
+			return 2
+		}
+		if strings.TrimSpace(outputFile) != "" {
+			fmt.Fprintln(os.Stderr, "参数错误: --output 不能用于多轮对话，请使用单次 --prompt 模式")
+			return 2
+		}
+	} else if prompt == "" {
 		prompt = "hello"
 	}
-	orchestration = strings.ToLower(strings.TrimSpace(orchestration))
 	if orchestration != "single" && orchestration != "plan" {
 		fmt.Fprintln(os.Stderr, "参数错误: --orchestration 必须是 single 或 plan")
 		return 2
@@ -143,7 +166,7 @@ func cmdRun(ctx context.Context, args []string) int {
 		}
 	}
 	cfg = cfg.WithAuditOverrides(auditFile, auditContent)
-	if cfg.Agent.Timeout > 0 {
+	if cfg.Agent.Timeout > 0 && !interactiveMode {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, cfg.Agent.Timeout)
 		defer cancel()
@@ -199,6 +222,9 @@ func cmdRun(ctx context.Context, args []string) int {
 	g.Logger.Info(ctx, "已构建 agent", "name", agent.Config().Name,
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
 		"plugins", len(agent.Plugins()), "tools", len(agent.Tools()))
+	if interactiveMode {
+		return runInteractive(ctx, g, agent, profile, resolvedToolsMode(toolsMode, toolsEnabled), sessionFile)
+	}
 
 	runInput := usecase.RunInput{
 		UserPrompt:    prompt,
@@ -305,6 +331,98 @@ func cmdRun(ctx context.Context, args []string) int {
 		_, _ = fmt.Fprintln(os.Stdout, "html:", outputFile)
 	}
 	return 0
+}
+
+// runInteractive keeps one Agent alive and sends every non-command input to
+// the same conversation session. The usecase already appends user and
+// assistant messages, so the CLI only needs to provide the outer read/print
+// loop.
+func runInteractive(
+	ctx context.Context,
+	g *infrastructure.Graph,
+	agent *entity.Agent,
+	profile entity.TaskProfile,
+	toolsMode string,
+	sessionFile string,
+) int {
+	reader := bufio.NewReader(os.Stdin)
+	_, _ = fmt.Fprintln(os.Stdout, "进入多轮对话模式。输入 /help 查看命令，输入 /exit 或 Ctrl-D 退出。")
+
+	for {
+		_, _ = fmt.Fprint(os.Stdout, "pi> ")
+		line, readErr := reader.ReadString('\n')
+		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			fmt.Fprintln(os.Stderr, "读取输入:", readErr)
+			return 1
+		}
+		prompt := strings.TrimSpace(line)
+		if prompt == "" {
+			if errors.Is(readErr, io.EOF) {
+				_, _ = fmt.Fprintln(os.Stdout)
+				return 0
+			}
+			continue
+		}
+
+		switch strings.ToLower(prompt) {
+		case "/exit", "/quit":
+			_, _ = fmt.Fprintln(os.Stdout, "再见。")
+			return 0
+		case "/help":
+			_, _ = fmt.Fprintln(os.Stdout, "命令：/help 查看帮助，/reset 清空当前对话，/exit 退出。")
+			if errors.Is(readErr, io.EOF) {
+				return 0
+			}
+			continue
+		case "/reset":
+			agent.ResetConversationSession()
+			if strings.TrimSpace(sessionFile) != "" {
+				if err := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); err != nil {
+					fmt.Fprintln(os.Stderr, "保存会话:", err)
+					return 1
+				}
+			}
+			_, _ = fmt.Fprintln(os.Stdout, "当前对话已清空。")
+			if errors.Is(readErr, io.EOF) {
+				return 0
+			}
+			continue
+		}
+
+		runCtx := ctx
+		cancel := func() {}
+		if timeout := g.Config.Agent.Timeout; timeout > 0 {
+			runCtx, cancel = context.WithTimeout(ctx, timeout)
+		}
+		out, err := g.RunUsecase.Execute(runCtx, agent, usecase.RunInput{
+			UserPrompt:    prompt,
+			TaskProfile:   profile,
+			ToolsMode:     toolsMode,
+			PromptVersion: g.Prompt.Version,
+		})
+		cancel()
+
+		if strings.TrimSpace(sessionFile) != "" {
+			if saveErr := infrastructure.SaveConversationSession(sessionFile, agent.ConversationSession()); saveErr != nil {
+				fmt.Fprintln(os.Stderr, "保存会话:", saveErr)
+				return 1
+			}
+		}
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "运行失败:", err)
+			if ctx.Err() != nil {
+				return 1
+			}
+		} else {
+			_, _ = fmt.Fprintln(os.Stdout, "assistant:")
+			_, _ = fmt.Fprintln(os.Stdout, out.FinalAnswer)
+			_, _ = fmt.Fprintf(os.Stdout, "[iterations=%d elapsed=%s]\n", out.Iterations, out.Elapsed.Round(time.Millisecond))
+		}
+
+		if errors.Is(readErr, io.EOF) {
+			return 0
+		}
+	}
 }
 
 // cmdSetup 显式运行首次配置向导。run 命令在发现配置不完整时也会自动
@@ -571,7 +689,8 @@ const helpText = `
 pi-agent — 精简 Clean Architecture Go AI Agent 骨架
 
 Usage:
-  pi-agent run [flags] [--prompt "hello"]  运行一次 agent 会话（默认命令）
+  pi-agent run [flags] [--prompt "hello"]  运行一次 agent 会话；终端中无 prompt 时进入多轮模式
+  pi-agent run --interactive              显式进入多轮对话模式
   pi-agent setup                         交互式配置本地或远程 LLM
   pi-agent providers                       列出内置 provider
   pi-agent version                 打印版本并退出
@@ -609,6 +728,7 @@ Usage:
   或显式 flags，程序不会阻塞等待输入。
 
 run flags:
+  --interactive                             持续读取多轮输入；/help、/reset、/exit 可用。
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
   --audit-file, --audit-content               仅覆盖本次运行的审计配置。
   --output path                                将最终回答清洗后保存为 HTML 文件。

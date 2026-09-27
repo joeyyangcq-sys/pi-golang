@@ -56,6 +56,38 @@ def main() -> int:
                 raise AssertionError(f"response audit missing model output: {records[1]}")
             if records[0]["run_id"] != records[1]["run_id"]:
                 raise AssertionError("audit events do not share a run_id")
+
+            interactive = subprocess.run(
+                ["go", "run", ".", "run", "--interactive"],
+                cwd=ROOT,
+                env=env,
+                input="/help\nfirst turn\nsecond turn\n/exit\n",
+                text=True,
+                capture_output=True,
+                timeout=90,
+                check=False,
+            )
+            if interactive.returncode != 0:
+                raise AssertionError(
+                    "Interactive Go CLI failed\n"
+                    f"stdout:\n{interactive.stdout}\n"
+                    f"stderr:\n{interactive.stderr}"
+                )
+            for answer in ("mock answer: first turn", "mock answer: second turn"):
+                if answer not in interactive.stdout:
+                    raise AssertionError(f"interactive output missing {answer!r}: {interactive.stdout}")
+            if "当前对话已清空" in interactive.stdout:
+                raise AssertionError("interactive test unexpectedly reset the conversation")
+
+            records = [json.loads(line) for line in audit_file.read_text(encoding="utf-8").splitlines()]
+            if len(records) != 6:
+                raise AssertionError(f"interactive run should add four audit records: {records}")
+            second_request = records[4]["request"]["Messages"]
+            if [message["content"] for message in second_request if message["role"] == "user"][-2:] != [
+                "first turn",
+                "second turn",
+            ]:
+                raise AssertionError(f"interactive history missing previous turn: {second_request}")
     finally:
         server.shutdown()
         server.server_close()
