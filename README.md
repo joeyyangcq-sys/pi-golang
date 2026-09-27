@@ -78,6 +78,10 @@ go run . run -prompt "请用一句话解释 Go interface" --debug
 go run .
 go run . run --interactive --session ./.pi-agent/session.json
 
+# 交互模式支持左右移动、Home/End、删除、历史上下键和 Ctrl-C 取消当前输入。
+# 交互终端默认不显示结构化运行日志；需要诊断时单独写入文件。
+go run . run --interactive --log-file ./.pi-agent/run.log
+
 # 也可以首次运行交互式配置；配置会保存到用户配置目录，API key 不回显。
 go run . setup
 ```

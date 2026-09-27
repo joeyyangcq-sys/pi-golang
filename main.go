@@ -16,6 +16,7 @@ import (
 
 	"pi-golang/internal/entity"
 	"pi-golang/internal/infrastructure"
+	cliterm "pi-golang/internal/terminal"
 	"pi-golang/internal/usecase"
 )
 
@@ -103,6 +104,7 @@ func cmdRun(ctx context.Context, args []string, streams Streams) int {
 	var model string
 	var auditFile string
 	var auditContent string
+	var logFile string
 	var outputFile string
 	var noTools bool
 	var toolsMode string
@@ -122,6 +124,7 @@ func cmdRun(ctx context.Context, args []string, streams Streams) int {
 	fs.StringVar(&model, "model", "", "本次使用的模型，覆盖 LLM_MODEL")
 	fs.StringVar(&auditFile, "audit-file", "", "JSONL 审计文件路径，记录每轮 LLM 输入输出")
 	fs.StringVar(&auditContent, "audit-content", "", "审计内容模式：redacted（默认）或 full")
+	fs.StringVar(&logFile, "log-file", "", "结构化运行日志文件；交互模式默认不把日志写入终端")
 	fs.StringVar(&outputFile, "output", "", "把最终回答作为 HTML 原子写入文件")
 	fs.BoolVar(&noTools, "no-tools", false, "本次运行不向 LLM 注册工具（适合纯文本/HTML 生成任务）")
 	fs.StringVar(&toolsMode, "tools", "auto", "工具模式：auto（默认）、enabled、disabled")
@@ -200,7 +203,23 @@ func cmdRun(ctx context.Context, args []string, streams Streams) int {
 		ctx, cancel = context.WithTimeout(ctx, cfg.Agent.Timeout)
 		defer cancel()
 	}
-	g, err := infrastructure.BuildWithConfigAndOutput(cfg, streams.Err)
+	var logOutput io.Writer = streams.Err
+	if interactiveMode {
+		// 交互终端只显示提示词、助手答案和用户可读错误。结构化日志
+		// 默认静默，避免 stderr 与正在编辑的输入行互相覆盖。
+		logOutput = io.Discard
+	}
+	var logHandle *os.File
+	if strings.TrimSpace(logFile) != "" {
+		logHandle, err = os.OpenFile(logFile, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+		if err != nil {
+			fmt.Fprintln(streams.Err, "打开运行日志:", err)
+			return 1
+		}
+		defer func() { _ = logHandle.Close() }()
+		logOutput = logHandle
+	}
+	g, err := infrastructure.BuildWithConfigAndOutput(cfg, logOutput)
 	if err != nil {
 		fmt.Fprintln(streams.Err, "启动:", err)
 		return 1
@@ -234,19 +253,18 @@ func cmdRun(ctx context.Context, args []string, streams Streams) int {
 	}
 	agent := g.NewAgent(ctx, agentOptions...)
 	if debug {
-		// Debug 输出写 stderr，避免与最终 answer 的 stdout 混在一起，便于
-		// 脚本只采集回答。提示词可能含业务上下文，生产环境请谨慎开启。
-		fmt.Fprintf(streams.Err, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
+		// Debug 输出写诊断流；交互模式默认静默，--log-file 可单独保存。
+		fmt.Fprintf(logOutput, "debug: prompt id=%s version=%s sha256=%s chars=%d\n",
 			g.Prompt.ID, g.Prompt.Version, g.Prompt.Hash, len(g.Prompt.Content))
-		fmt.Fprintf(streams.Err, "debug: model=%q provider=%q base_url=%q max_tokens=%d max_iterations=%d timeout=%s tools=%d tools_mode=%s\n",
+		fmt.Fprintf(logOutput, "debug: model=%q provider=%q base_url=%q max_tokens=%d max_iterations=%d timeout=%s tools=%d tools_mode=%s\n",
 			agent.Config().Model, g.Config.LLM.Provider, g.Config.LLM.BaseURL, agent.Config().MaxTokens, agent.Config().MaxIterations, agent.Config().Timeout, len(agent.Tools()), toolsMode)
 		for _, tool := range agent.Tools() {
 			info := tool.Info()
-			_, _ = fmt.Fprintf(streams.Err, "debug: tool name=%q description=%q schema=%s\n",
+			_, _ = fmt.Fprintf(logOutput, "debug: tool name=%q description=%q schema=%s\n",
 				info.Name, info.Description, string(info.InputSchema))
 		}
-		fmt.Fprintln(streams.Err, "debug: system prompt follows")
-		fmt.Fprintln(streams.Err, g.Prompt.Content)
+		fmt.Fprintln(logOutput, "debug: system prompt follows")
+		fmt.Fprintln(logOutput, g.Prompt.Content)
 	}
 	g.Logger.Info(ctx, "已构建 agent", "name", agent.Config().Name,
 		"has_llm", agent.LLM() != nil, "has_memory", agent.Memory() != nil,
@@ -379,20 +397,48 @@ func runInteractive(
 	streams Streams,
 ) int {
 	streams = withDefaultStreams(streams)
-	reader := bufio.NewReader(streams.In)
 	_, _ = fmt.Fprintln(streams.Out, "进入多轮对话模式。输入 /help 查看命令，输入 /exit 或 Ctrl-D 退出。")
+	var reader *bufio.Reader
+	var editor *cliterm.LineEditor
+	if terminal, ok := streams.In.(*os.File); ok && isInteractive(terminal) {
+		var editorErr error
+		editor, editorErr = cliterm.NewLineEditor(terminal, streams.Out, "pi> ")
+		if editorErr != nil {
+			fmt.Fprintln(streams.Err, "启用行编辑失败，退回整行输入:", editorErr)
+		}
+	}
+	if editor == nil {
+		reader = bufio.NewReader(streams.In)
+	}
 
 	for {
-		_, _ = fmt.Fprint(streams.Out, "pi> ")
-		line, readErr := reader.ReadString('\n')
+		var line string
+		var readErr error
+		if editor != nil {
+			line, readErr = editor.ReadLine()
+			if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, cliterm.ErrInterrupt) {
+				fmt.Fprintln(streams.Err, "行编辑不可用，退回整行输入:", readErr)
+				editor = nil
+				reader = bufio.NewReader(streams.In)
+				continue
+			}
+		} else {
+			_, _ = fmt.Fprint(streams.Out, "pi> ")
+			line, readErr = reader.ReadString('\n')
+		}
 		if readErr != nil && !errors.Is(readErr, io.EOF) {
+			if errors.Is(readErr, cliterm.ErrInterrupt) {
+				continue
+			}
 			fmt.Fprintln(streams.Err, "读取输入:", readErr)
 			return 1
 		}
 		prompt := strings.TrimSpace(line)
 		if prompt == "" {
 			if errors.Is(readErr, io.EOF) {
-				_, _ = fmt.Fprintln(streams.Out)
+				if editor == nil {
+					_, _ = fmt.Fprintln(streams.Out)
+				}
 				return 0
 			}
 			continue
@@ -767,6 +813,7 @@ run flags:
   --interactive                             持续读取多轮输入；/help、/reset、/exit 可用。
   --provider, --model, --api-key, --base-url  仅覆盖本次运行的 LLM 配置。
   --audit-file, --audit-content               仅覆盖本次运行的审计配置。
+  --log-file path                             将结构化运行日志单独写入文件；交互模式默认静默。
   --output path                                将最终回答清洗后保存为 HTML 文件。
   --tools auto|enabled|disabled                auto 保留通用 Agent 工具；可显式收窄为 disabled。
   --task-profile auto|generation|agent-readonly|agent-mutation
