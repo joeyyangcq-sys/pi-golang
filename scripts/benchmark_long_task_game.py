@@ -40,6 +40,19 @@ TASK_PROMPT = """这是一个长 coding 任务。请在当前空工作区交付�
 
 实现质量要求：代码结构清晰，避免外部依赖；在没有图片素材时用 canvas、CSS、渐变、几何图形和文字建立深色科幻战场；游戏必须有明确的胜负/波次反馈和可操作性。敌人从待生成队列进入活动列表的路径必须完整；接触伤害必须有基于时间的受击冷却，不能按每个动画帧连续扣血。每个 write/edit 工具调用只处理一个文件，避免在一个超长工具调用里写多个文件。请实际写入文件并验证，不要声称执行过没有执行的命令。"""
 
+GO_ORCHESTRATION_PROMPT = """这是唯一一次顶层用户提示。由 pi-golang 自己管理长任务的多会话编排：先规划任务图，每个实际子任务使用独立 worker 会话，最后由独立 verifier 验收。协议修正必须在同一角色会话内继续，不能由外层脚本拆分任务或追加用户提示。等待全部子任务和验收结束后再返回最终结果。
+
+""" + TASK_PROMPT
+
+PI_ORCHESTRATION_PROMPT = """这是唯一一次顶层用户提示。你是主协调 Agent，必须使用可用的 subagent 工具自行管理多个独立会话，不能只在当前会话直接完成全部实现：
+1. 先委派 planner 会话读取需求并形成任务计划；
+2. 按计划为实际实现任务委派一个或多个 worker 会话，共享当前工作区；有依赖的任务顺序执行，互不依赖且不改同一文件的任务才可并行；
+3. 实现后委派 reviewer 会话读取实际文件并运行验证；发现问题时再委派 worker 修复并重新验收；
+4. 主协调会话只负责规划、委派、汇总和确认结果，不直接使用写入工具实现源文件。一次 subagent 调用的数量限制只是批次限制，需要更多任务时继续分批委派。
+所有子会话都必须等待完成。只有实际文件通过验收后才能给出最终回答。
+
+""" + TASK_PROMPT
+
 REQUIRED_FILES = ("PLAN.md", "index.html", "styles.css", "game.js", "README.md")
 
 
@@ -82,10 +95,55 @@ def write_pi_long_config(directory: Path, base_url: str, model: str, profile: Di
         }
     }
     (directory / "settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    agents_dir = directory / "agents"
+    agents_dir.mkdir(parents=True, exist_ok=True)
+    agent_definitions = {
+        "planner.md": """---
+name: planner
+description: Read-only planner that decomposes the supplied objective into cohesive implementation work packages
+tools: read, grep, find, ls
+---
+Inspect the task and current workspace. Produce the fewest cohesive implementation tasks needed to finish the objective. Include dependencies, files, and observable acceptance criteria. Do not modify files.
+""",
+        "worker.md": """---
+name: worker
+description: General coding worker with an isolated context that implements and verifies one delegated work package
+tools: read, bash, edit, write, grep, find, ls
+---
+Complete the delegated work package in the shared workspace. Inspect existing work first, preserve valid prior changes, implement the objective, and run relevant checks. Report exact files and evidence. Do not merely describe code.
+""",
+        "reviewer.md": """---
+name: reviewer
+description: Independent verifier that inspects the integrated workspace and runs acceptance checks
+tools: read, bash, grep, find, ls
+---
+Independently verify the complete objective in the actual workspace. Run relevant commands, inspect runtime logic, and report pass or concrete failures. Do not modify files or trust worker claims without evidence.
+""",
+    }
+    for name, content in agent_definitions.items():
+        (agents_dir / name).write_text(content, encoding="utf-8")
     env = os.environ.copy()
     env["PI_CODING_AGENT_DIR"] = str(directory)
     env["PI_OFFLINE"] = "1"
     return env
+
+
+def find_pi_subagent_extension(pi_path: str) -> Path:
+    launcher = Path(pi_path).resolve()
+    agent_dir = launcher.parent.parent
+    current_version = agent_dir / "install" / "current-version"
+    candidates: List[Path] = []
+    if current_version.exists():
+        version = current_version.read_text(encoding="utf-8").strip()
+        if version:
+            candidates.append(agent_dir / "install" / "releases" / version)
+    candidates.extend(sorted((agent_dir / "install" / "releases").glob("*"), reverse=True))
+    relative = Path("node_modules/@earendil-works/pi-coding-agent/examples/extensions/subagent/index.ts")
+    for release in candidates:
+        extension = release / relative
+        if extension.is_file() and (extension.parent / "agents.ts").is_file():
+            return extension
+    raise FileNotFoundError("Pi subagent extension was not found in the managed installation")
 
 
 def prepare_workspace(path: Path) -> None:
@@ -142,6 +200,21 @@ def validate_game(workspace: Path) -> Dict[str, Any]:
         re.IGNORECASE,
     ):
         issues.append("spawn_queue_never_activates_enemies")
+    if (
+        re.search(r"visible\s*:\s*false", js, re.IGNORECASE)
+        and re.search(r"if\s*\(\s*!\s*\w+\.visible\s*\)\s*continue", js, re.IGNORECASE)
+        and not re.search(r"\.visible\s*=\s*true", js, re.IGNORECASE)
+    ):
+        issues.append("spawned_enemies_never_become_visible")
+    if (
+        re.search(r"click\s+to\s+start", html, re.IGNORECASE)
+        and not re.search(
+            r"(?:addEventListener\s*\(\s*['\"](?:click|pointerdown|mousedown)['\"][\s\S]{0,500}?(?:state\s*={2,3}\s*['\"]menu|initGame\s*\()|onclick\s*=)",
+            combined,
+            re.IGNORECASE,
+        )
+    ):
+        issues.append("click_to_start_has_no_start_handler")
     if not re.search(r"invulner|damage[_A-Za-z]*cooldown|hit[_A-Za-z]*cooldown|last[_A-Za-z]*damage|next[_A-Za-z]*damage", js, re.IGNORECASE):
         issues.append("missing_contact_damage_cooldown")
 
@@ -176,12 +249,61 @@ def extract_pi_answer(events: Iterable[Dict[str, Any]]) -> str:
     return answer.strip()
 
 
+def pi_tool_name(event: Dict[str, Any]) -> str:
+    return str(event.get("toolName") or event.get("tool_name") or event.get("name") or "")
+
+
+def extract_pi_subagent_results(events: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    children: List[Dict[str, Any]] = []
+    for event in events:
+        if event.get("type") != "tool_execution_end" or pi_tool_name(event) != "subagent":
+            continue
+        result = event.get("result") or {}
+        details = result.get("details") if isinstance(result, dict) else None
+        rows = details.get("results") if isinstance(details, dict) else None
+        if not isinstance(rows, list):
+            continue
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_usage = row.get("usage") or {}
+            messages = row.get("messages") if isinstance(row.get("messages"), list) else []
+            child_tool_calls = 0
+            for message in messages:
+                if not isinstance(message, dict) or message.get("role") != "assistant":
+                    continue
+                content = message.get("content")
+                if isinstance(content, list):
+                    child_tool_calls += sum(1 for part in content if isinstance(part, dict) and part.get("type") == "toolCall")
+            task = str(row.get("task") or "")
+            children.append({
+                "agent": str(row.get("agent") or ""),
+                "agent_source": str(row.get("agentSource") or ""),
+                "task_sha256": sha256_text(task) if task else "",
+                "exit_code": common.int_value(row.get("exitCode")),
+                "stop_reason": str(row.get("stopReason") or ""),
+                "error": str(row.get("errorMessage") or row.get("stderr") or "")[-1000:],
+                "model": str(row.get("model") or ""),
+                "tool_calls": child_tool_calls,
+                "usage": {
+                    "input": common.int_value(raw_usage.get("input")),
+                    "output": common.int_value(raw_usage.get("output")),
+                    "cache_read": common.int_value(raw_usage.get("cacheRead")),
+                    "cache_write": common.int_value(raw_usage.get("cacheWrite")),
+                    "turns": common.int_value(raw_usage.get("turns")),
+                },
+            })
+    return children
+
+
 def parse_pi_events(stdout: str) -> Dict[str, Any]:
     events = list(common.safe_json_lines(stdout))
     compaction_start = [event for event in events if event.get("type") == "compaction_start"]
     compaction_end = [event for event in events if event.get("type") == "compaction_end"]
     errors = [event for event in events if event.get("type") in {"error", "agent_error"}]
     tool_starts = [event for event in events if event.get("type") == "tool_execution_start"]
+    subagent_calls = [event for event in tool_starts if pi_tool_name(event) == "subagent"]
+    child_results = extract_pi_subagent_results(events)
     assistant_messages = [
         event for event in events
         if event.get("type") == "message_end"
@@ -197,6 +319,17 @@ def parse_pi_events(stdout: str) -> Dict[str, Any]:
         usage["reasoning"] += common.int_value(raw.get("reasoning"))
         usage["cache_read"] += common.int_value(raw.get("cacheRead"))
         usage["cache_write"] += common.int_value(raw.get("cacheWrite"))
+    child_turns = 0
+    child_tool_calls = 0
+    for child in child_results:
+        raw = child["usage"]
+        usage["input"] += raw["input"]
+        usage["output"] += raw["output"]
+        usage["total"] += raw["input"] + raw["output"]
+        usage["cache_read"] += raw["cache_read"]
+        usage["cache_write"] += raw["cache_write"]
+        child_turns += raw["turns"]
+        child_tool_calls += child["tool_calls"]
     compactions: List[Dict[str, Any]] = []
     for event in compaction_end:
         result = event.get("result") or {}
@@ -213,7 +346,14 @@ def parse_pi_events(stdout: str) -> Dict[str, Any]:
     return {
         "events": len(events),
         "assistant_messages": len(assistant_messages),
-        "tool_calls": len(tool_starts),
+        "tool_calls": len(tool_starts) + child_tool_calls,
+        "conversations": 1 + len(child_results),
+        "agent_turns": len(assistant_messages) + child_turns,
+        "subagent_calls": len(subagent_calls),
+        "child_conversations": len(child_results),
+        "child_failures": sum(1 for child in child_results if child["exit_code"] != 0 or child["stop_reason"] in {"error", "aborted"}),
+        "child_agents": [child["agent"] for child in child_results],
+        "child_results": child_results,
         "errors": len(errors),
         "compaction_starts": len(compaction_start),
         "compaction_ends": len(compaction_end),
@@ -309,6 +449,8 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         f"- Model: `{args.model}`",
         f"- Context window: `{CONTEXT_WINDOW}`; reserve `{CONTEXT_RESERVE}`; keep recent `{CONTEXT_KEEP_RECENT}`.",
         "- Task: plan first, then implement and validate an original Warhammer 40,000 themed browser defense shooter.",
+        "- Invocation contract: one top-level process and one initial user prompt per runner; the driver sends no follow-up prompts and performs no task scheduling.",
+        f"- Go prompt SHA-256: `{sha256_text(GO_ORCHESTRATION_PROMPT)}`; Pi prompt SHA-256: `{sha256_text(PI_ORCHESTRATION_PROMPT)}`.",
         "",
         "## Runner results",
         "",
@@ -343,14 +485,29 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
                 f"`{json.dumps(record['orchestration_role_requests'], sort_keys=True)}`; "
                 f"worker tasks: `{', '.join(record.get('worker_task_ids', [])) or 'none'}`."
             )
+        if record["runner"] == "pi":
+            lines.append(
+                f"  Parent subagent calls: `{record.get('subagent_calls', 0)}`; child conversations: "
+                f"`{record.get('child_conversations', 0)}`; child failures: `{record.get('child_failures', 0)}`; "
+                f"agents: `{', '.join(record.get('child_agents', [])) or 'none'}`."
+            )
+    runtime_records = [record for record in records if record.get("runtime_validation")]
+    if runtime_records:
+        lines.extend(["", "## Browser runtime smoke test", ""])
+        for record in runtime_records:
+            runtime = record["runtime_validation"]
+            lines.append(
+                f"- `{record['runner']}`: `{runtime.get('status', 'unknown')}`; "
+                f"{runtime.get('summary', '')}"
+            )
     lines.extend([
         "",
         "## Audit capability check",
         "",
         "- Go: JSONL includes every request/response, tool dispatch, compaction trigger/result/error/fallback, token usage, request shape, summary length/hash and compaction boundary.",
-        "- Pi: JSON event stream includes tool executions and compaction start/end; compaction result exposes tokens before, summary usage and summary text hash in this runner.",
+        "- Pi: the parent JSON event stream includes every parent tool execution plus the stock subagent tool's child result, usage, model, exit status and turn count. The shared proxy captures parent and child LLM requests.",
         "- Shared proxy: both runners have redacted wire payload shape, message count, tool presence and generation-field evidence.",
-        "- Limitation: Pi and Go use different tool schemas and internal token estimators; compare completion and direction of compaction behavior, not exact per-message token equality.",
+        "- Limitation: the stock Pi subagent extension does not forward each child's compaction events into the parent event stream, so Pi compaction counts cover the parent session while wire request totals cover all sessions. Pi and Go also use different token estimators.",
         "",
         "## Wire summary",
         "",
@@ -362,8 +519,9 @@ def write_report(path: Path, args: argparse.Namespace, records: Sequence[Dict[st
         "",
         "- `records.jsonl`: normalized runner metrics and validation evidence.",
         "- `wire-requests.jsonl`: redacted requests captured by the local proxy.",
+        "- `browser-validation.json`: browser runtime smoke-test evidence, when present.",
         "- `go/audit.jsonl`: Go audit events.",
-        "- `pi/events.jsonl`: Pi JSON event stream.",
+        "- `pi/events.jsonl`: Pi parent JSON event stream including subagent tool results.",
         "- `go/workspace/` and `pi/workspace/`: final generated projects.",
     ])
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -380,11 +538,22 @@ def main() -> int:
     pi_path = shutil.which("pi")
     if not pi_path:
         parser.error("未找到 pi CLI")
+    try:
+        pi_subagent_extension = find_pi_subagent_extension(pi_path)
+    except FileNotFoundError as exc:
+        parser.error(str(exc))
     profile = common.load_request_profile(args.request_profile)
     output_dir = (ROOT / args.output_dir).resolve()
+    comparison_root = (ROOT / "artifacts" / "comparison").resolve()
+    if output_dir == comparison_root or os.path.commonpath((str(output_dir), str(comparison_root))) != str(comparison_root):
+        parser.error("--output-dir must name a child directory of artifacts/comparison")
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     (output_dir / "request-profile.json").write_text(json.dumps(profile, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     (output_dir / "task-prompt.md").write_text(TASK_PROMPT + "\n", encoding="utf-8")
+    (output_dir / "go-task-prompt.md").write_text(GO_ORCHESTRATION_PROMPT + "\n", encoding="utf-8")
+    (output_dir / "pi-task-prompt.md").write_text(PI_ORCHESTRATION_PROMPT + "\n", encoding="utf-8")
     records_path = output_dir / "records.jsonl"
     wire_path = output_dir / "wire-requests.jsonl"
     for path in (records_path, wire_path):
@@ -429,7 +598,7 @@ def main() -> int:
         go_env = dict(base_env)
         go_command = [
             str(binary), "run", "--provider", "lmstudio", "--base-url", f"{proxy_base_url}/go-long{api_path}",
-            "--model", args.model, "--prompt", TASK_PROMPT, "--audit-file", str(go_audit),
+            "--model", args.model, "--prompt", GO_ORCHESTRATION_PROMPT, "--audit-file", str(go_audit),
             "--tools", "enabled", "--task-profile", "agent-mutation", "--orchestration", "plan",
             "--max-plan-tasks", "16", "--protocol-attempts", "4", "--worker-attempts", "1",
             "--max-replans", "2",
@@ -438,10 +607,16 @@ def main() -> int:
             go_code, go_stdout, go_stderr, go_wall = common.run_command(go_command, go_env, args.timeout, cwd=go_dir / "workspace")
             go_validation = validate_game(go_dir / "workspace")
             go_parsed = parse_go_run(go_audit, go_stdout)
+            if go_parsed.get("conversations", 1) < 3:
+                go_validation["quality_issues"].append("orchestration_did_not_create_multiple_conversations")
+            if not go_parsed.get("worker_task_ids"):
+                go_validation["quality_issues"].append("orchestration_created_no_worker_conversation")
+            go_validation["task_success"] = not go_validation["quality_issues"]
             go_record = {
                 "runner": "pi-golang", "exit_code": go_code, "wall_ms": round(go_wall, 3),
                 "task_success": go_code == 0 and bool(go_validation["task_success"]),
                 "quality_issues": go_validation["quality_issues"], "validation": go_validation,
+                "top_level_invocations": 1, "initial_prompts": 1, "driver_followup_prompts": 0,
                 "stderr_tail": go_stderr[-2000:], "stdout_tail": go_stdout[-2000:],
                 **go_parsed,
             }
@@ -453,17 +628,29 @@ def main() -> int:
             pi_command = [
                 pi_path, "--provider", "lmstudio", "--model", args.model, "--api-key", "lm-studio-local",
                 "--no-session", "--no-context-files", "--no-skills", "--no-prompt-templates", "--no-extensions",
-                "--offline", "--thinking", "off", "--tools", "read,bash,edit,write,find,grep,ls",
+                "--extension", str(pi_subagent_extension),
+                "--offline", "--thinking", "off", "--tools", "read,find,grep,ls,subagent",
                 "--system-prompt", common.load_text(ROOT / "internal/prompt/base.md"),
-                "--mode", "json", "--print", "--", TASK_PROMPT,
+                "--mode", "json", "--print", "--", PI_ORCHESTRATION_PROMPT,
             ]
             pi_code, pi_stdout, pi_stderr, pi_wall = common.run_command(pi_command, pi_env, args.timeout, cwd=pi_dir / "workspace")
             pi_events = parse_pi_events(pi_stdout)
             pi_validation = validate_game(pi_dir / "workspace")
+            required_child_agents = {"planner", "worker", "reviewer"}
+            observed_child_agents = set(pi_events.get("child_agents", []))
+            if pi_events.get("child_conversations", 0) < 3:
+                pi_validation["quality_issues"].append("subagent_did_not_create_multiple_child_conversations")
+            missing_child_agents = sorted(required_child_agents - observed_child_agents)
+            if missing_child_agents:
+                pi_validation["quality_issues"].append("subagent_missing_roles:" + ",".join(missing_child_agents))
+            if pi_events.get("child_failures", 0):
+                pi_validation["quality_issues"].append("subagent_child_failure")
+            pi_validation["task_success"] = not pi_validation["quality_issues"]
             pi_record = {
                 "runner": "pi", "exit_code": pi_code, "wall_ms": round(pi_wall, 3),
                 "task_success": pi_code == 0 and bool(pi_validation["task_success"]),
                 "quality_issues": pi_validation["quality_issues"], "validation": pi_validation,
+                "top_level_invocations": 1, "initial_prompts": 1, "driver_followup_prompts": 0,
                 "stderr_tail": pi_stderr[-2000:], "stdout_tail": pi_stdout[-2000:],
                 **pi_events,
             }
